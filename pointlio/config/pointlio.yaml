@@ -1,0 +1,57 @@
+# Point-LIO (output model) config for a real Livox sensor (CustomMsg input).
+# The IMU is fused as a measurement: body angular velocity / specific force are
+# random-walk states, so points are processed at their own timestamps without
+# scan undistortion.
+imu_topic: /livox/imu
+lidar_topic: /livox/lidar
+body_frame: body
+world_frame: lidar
+print_time_cost: false
+
+# 0: livox CustomMsg (per-point time -> full point-by-point update),
+# 1: sensor_msgs/PointCloud2 (no per-point time -> one batch update per scan)
+lidar_type: 0
+# Livox IMU accel is in g-units -> x10 to m/s^2 (satu_acc is compared AFTER scaling)
+imu_acc_scale: 10.0
+
+lidar_filter_num: 6
+lidar_min_range: 0.5
+lidar_max_range: 30.0
+# Coarser than fastlio2 (0.15): every point group costs an EKF update, keep
+# headroom on Jetson. Lower for more detail if time cost allows.
+scan_resolution: 0.25
+map_resolution: 0.3
+
+cube_len: 300
+det_range: 60
+move_thresh: 1.5
+
+# process noise driving the omg/acc random-walk states
+gyr_cov_output: 1000.0
+acc_cov_output: 500.0
+b_gyr_cov: 0.0001
+b_acc_cov: 0.0001
+
+# IMU-as-measurement noise
+imu_meas_omg_cov: 0.1
+imu_meas_acc_cov: 0.1
+
+# saturation thresholds: axes at/over these are dropped from the IMU update
+# satu_gyro in rad/s; satu_acc in m/s^2 (after imu_acc_scale, ~3g)
+satu_gyro: 35.0
+satu_acc: 30.0
+
+# point-to-plane measurement
+lidar_meas_cov: 0.01
+plane_thr: 0.1
+# split same-timestamp groups larger than this into sequential chunks
+batch_max_points: 500
+
+imu_init_num: 20
+near_search_num: 5
+
+gravity_align: true
+esti_il: false
+
+r_il: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+t_il: [-0.011, -0.02329, 0.04412]

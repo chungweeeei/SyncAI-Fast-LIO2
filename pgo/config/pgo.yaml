@@ -1,0 +1,19 @@
+# Base (un-namespaced) values. pgo_isaac_launch.py rewrites cloud_topic /
+# odom_topic / local_frame with the <robot_id>/ prefix read from
+# config/system.ini; these plain values only apply when launched via the
+# original pgo_launch.py.
+cloud_topic: /fastlio2/body_cloud
+odom_topic: /fastlio2/lio_odom
+map_frame: map
+# LIO world frame that pgo's map->local_frame TF should correct
+# (matches lio_isaac.yaml world_frame; original upstream value was "lidar").
+local_frame: lio_odom
+
+key_pose_delta_deg: 10
+key_pose_delta_trans: 0.5
+loop_search_radius: 1.0
+loop_time_tresh: 60.0
+loop_score_tresh: 0.15
+loop_submap_half_range: 5
+submap_resolution: 0.1
+min_loop_detect_duration: 5.0

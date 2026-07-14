@@ -1,0 +1,51 @@
+# FASTLIO2 config for Isaac Sim — PointCloud2 lidar input.
+# Differs from lio.yaml (real Livox) in: lidar_type, imu_acc_scale, topics,
+# frames, and identity lidar->imu extrinsic (co-located in sim).
+#
+# NOTE: the Isaac launches (lio_isaac_launch / localizer_isaac_launch /
+# pgo_isaac_launch) rewrite imu_topic / lidar_topic / body_frame / world_frame
+# with the <robot_id> read from config/system.ini into a generated file under
+# /tmp — the values below are only fallbacks for running without those
+# launches.
+imu_topic: /robot06/livox/imu
+lidar_topic: /robot06/livox/lidar
+
+# Standalone frames so lio_node's world->body TF broadcast does NOT collide
+# with robot_state_publisher (which already parents <robot_id>/lidar_top).
+# The launches prefix these with <robot_id>/ (e.g. robot06/lio_odom).
+body_frame: lio_body
+world_frame: lio_odom
+print_time_cost: false
+
+# 0: livox CustomMsg (default), 1: sensor_msgs/PointCloud2 (Isaac Sim)
+lidar_type: 1
+# Isaac IMU accel is already m/s^2 (z~9.81 at rest); do NOT apply the Livox g->m/s^2 x10.
+imu_acc_scale: 1.0
+
+lidar_filter_num: 3
+lidar_min_range: 0.5
+lidar_max_range: 40.0
+scan_resolution: 0.15
+map_resolution: 0.3
+
+cube_len: 300
+det_range: 60
+move_thresh: 1.5
+
+na: 0.01
+ng: 0.01
+nba: 0.0001
+nbg: 0.0001
+
+imu_init_num: 40
+near_search_num: 5
+ieskf_max_iter: 5
+
+gravity_align: true
+esti_il: false
+
+# IMU co-located with lidar prim in sim -> identity extrinsic.
+r_il: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+t_il: [0.0, 0.0, 0.0]
+
+lidar_cov_inv: 1000.0

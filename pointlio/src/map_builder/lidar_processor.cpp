@@ -1,0 +1,279 @@
+#include "lidar_processor.h"
+
+LidarProcessor::LidarProcessor(Config &config, std::shared_ptr<PointEKF> kf) : m_config(config), m_kf(kf)
+{
+    m_ikdtree = std::make_shared<KD_TREE<PointType>>();
+    m_ikdtree->set_downsample_param(m_config.map_resolution);
+    m_cloud_down_lidar.reset(new CloudType);
+    m_cloud_down_world.reset(new CloudType(10000, 1));
+    m_norm_vec.reset(new CloudType(10000, 1));
+    m_nearest_points.resize(10000);
+    m_point_selected_flag.resize(10000, false);
+    m_H.resize(m_config.batch_max_points, 12);
+    m_z.resize(m_config.batch_max_points);
+
+    if (m_config.scan_resolution > 0.0)
+    {
+        m_scan_filter.setLeafSize(m_config.scan_resolution, m_config.scan_resolution, m_config.scan_resolution);
+    }
+}
+
+void LidarProcessor::trimCloudMap()
+{
+    m_local_map.cub_to_rm.clear();
+    const State &state = m_kf->x();
+    Eigen::Vector3d pos_lidar = state.t_wi + state.r_wi * state.t_il;
+
+    if (!m_local_map.initialed)
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            m_local_map.local_map_corner.vertex_min[i] = pos_lidar[i] - m_config.cube_len / 2.0;
+            m_local_map.local_map_corner.vertex_max[i] = pos_lidar[i] + m_config.cube_len / 2.0;
+        }
+        m_local_map.initialed = true;
+        return;
+    }
+    float dist_to_map_edge[3][2];
+    bool need_move = false;
+    double det_thresh = m_config.move_thresh * m_config.det_range;
+    for (int i = 0; i < 3; i++)
+    {
+        dist_to_map_edge[i][0] = fabs(pos_lidar(i) - m_local_map.local_map_corner.vertex_min[i]);
+        dist_to_map_edge[i][1] = fabs(pos_lidar(i) - m_local_map.local_map_corner.vertex_max[i]);
+
+        if (dist_to_map_edge[i][0] <= det_thresh || dist_to_map_edge[i][1] <= det_thresh)
+            need_move = true;
+    }
+    if (!need_move)
+        return;
+    BoxPointType new_corner, temp_corner;
+    new_corner = m_local_map.local_map_corner;
+    float mov_dist = std::max((m_config.cube_len - 2.0 * m_config.move_thresh * m_config.det_range) * 0.5 * 0.9, double(m_config.det_range * (m_config.move_thresh - 1)));
+
+    for (int i = 0; i < 3; i++)
+    {
+        temp_corner = m_local_map.local_map_corner;
+        if (dist_to_map_edge[i][0] <= det_thresh)
+        {
+            new_corner.vertex_max[i] -= mov_dist;
+            new_corner.vertex_min[i] -= mov_dist;
+            temp_corner.vertex_min[i] = m_local_map.local_map_corner.vertex_max[i] - mov_dist;
+            m_local_map.cub_to_rm.push_back(temp_corner);
+        }
+        else if (dist_to_map_edge[i][1] <= det_thresh)
+        {
+            new_corner.vertex_max[i] += mov_dist;
+            new_corner.vertex_min[i] += mov_dist;
+            temp_corner.vertex_max[i] = m_local_map.local_map_corner.vertex_min[i] + mov_dist;
+            m_local_map.cub_to_rm.push_back(temp_corner);
+        }
+    }
+    m_local_map.local_map_corner = new_corner;
+
+    PointVec points_history;
+    m_ikdtree->acquire_removed_points(points_history);
+
+    // 删除局部地图之外的点云
+    if (m_local_map.cub_to_rm.size() > 0)
+        m_ikdtree->Delete_Point_Boxes(m_local_map.cub_to_rm);
+    return;
+}
+
+void LidarProcessor::incrCloudMap()
+{
+    if (m_cloud_down_lidar->empty())
+        return;
+    // m_cloud_down_world 已在 processGroup / updateChunk 內用「各點群自己時間點
+    // 的狀態」轉好 (point-by-point 等效去畸變)，這裡直接使用不再重算。
+    int size = m_cloud_down_lidar->size();
+    PointVec point_to_add;
+    PointVec point_no_need_downsample;
+    for (int i = 0; i < size; i++)
+    {
+        // 如果该点附近没有近邻点则需要添加到地图中
+        if (m_nearest_points[i].empty())
+        {
+            point_to_add.push_back(m_cloud_down_world->points[i]);
+            continue;
+        }
+
+        const PointVec &points_near = m_nearest_points[i];
+        bool need_add = true;
+        PointType mid_point;
+        mid_point.x = std::floor(m_cloud_down_world->points[i].x / m_config.map_resolution) * m_config.map_resolution + 0.5 * m_config.map_resolution;
+        mid_point.y = std::floor(m_cloud_down_world->points[i].y / m_config.map_resolution) * m_config.map_resolution + 0.5 * m_config.map_resolution;
+        mid_point.z = std::floor(m_cloud_down_world->points[i].z / m_config.map_resolution) * m_config.map_resolution + 0.5 * m_config.map_resolution;
+
+        // 如果该点所在的voxel没有点，则直接加入地图，且不需要降采样
+        if (fabs(points_near[0].x - mid_point.x) > 0.5 * m_config.map_resolution && fabs(points_near[0].y - mid_point.y) > 0.5 * m_config.map_resolution && fabs(points_near[0].z - mid_point.z) > 0.5 * m_config.map_resolution)
+        {
+            point_no_need_downsample.push_back(m_cloud_down_world->points[i]);
+            continue;
+        }
+        float dist = sq_dist(m_cloud_down_world->points[i], mid_point);
+
+        for (int readd_i = 0; readd_i < m_config.near_search_num; readd_i++)
+        {
+            // 如果该点的近邻点较少，则需要加入到地图中
+            if (points_near.size() < static_cast<size_t>(m_config.near_search_num))
+                break;
+            // 如果该点的近邻点距离voxel中心点的距离比该点距离voxel中心点更近，则不需要加入该点
+            if (sq_dist(points_near[readd_i], mid_point) < dist)
+            {
+                need_add = false;
+                break;
+            }
+        }
+        if (need_add)
+            point_to_add.push_back(m_cloud_down_world->points[i]);
+    }
+    m_ikdtree->Add_Points(point_to_add, true);
+    m_ikdtree->Add_Points(point_no_need_downsample, false);
+}
+
+void LidarProcessor::initCloudMap(PointVec &point_vec)
+{
+    m_ikdtree->Build(point_vec);
+}
+
+void LidarProcessor::preprocess(SyncPackage &package, Vec<PointGroup> &groups)
+{
+    if (m_config.scan_resolution > 0.0)
+    {
+        m_scan_filter.setInputCloud(package.cloud);
+        m_scan_filter.filter(*m_cloud_down_lidar);
+    }
+    else
+    {
+        pcl::copyPointCloud(*package.cloud, *m_cloud_down_lidar);
+    }
+
+    // voxel filter 不保留時間順序，重新依 curvature (每點時間偏移 ms) 排序
+    std::sort(m_cloud_down_lidar->points.begin(), m_cloud_down_lidar->points.end(),
+              [](const PointType &p1, const PointType &p2)
+              { return p1.curvature < p2.curvature; });
+
+    int size = m_cloud_down_lidar->size();
+    if (static_cast<int>(m_cloud_down_world->size()) < size)
+    {
+        m_cloud_down_world->resize(size);
+        m_norm_vec->resize(size);
+        m_nearest_points.resize(size);
+        m_point_selected_flag.resize(size, false);
+    }
+
+    // time compressing: 相同時間戳的點分成一組
+    groups.clear();
+    int begin = 0;
+    for (int i = 1; i <= size; i++)
+    {
+        if (i == size || m_cloud_down_lidar->points[i].curvature != m_cloud_down_lidar->points[begin].curvature)
+        {
+            double group_time = package.cloud_start_time + m_cloud_down_lidar->points[begin].curvature / 1000.0;
+            groups.push_back({group_time, begin, i});
+            begin = i;
+        }
+    }
+}
+
+void LidarProcessor::processGroup(const PointGroup &group)
+{
+    for (int chunk_begin = group.begin; chunk_begin < group.end; chunk_begin += m_config.batch_max_points)
+    {
+        int chunk_end = std::min(chunk_begin + m_config.batch_max_points, group.end);
+        updateChunk(chunk_begin, chunk_end);
+    }
+}
+
+void LidarProcessor::updateChunk(int begin, int end)
+{
+    const State &state = m_kf->x();
+#ifdef MP_EN
+    omp_set_num_threads(MP_PROC_NUM);
+#pragma omp parallel for
+#endif
+    for (int i = begin; i < end; i++)
+    {
+        PointType &point_body = m_cloud_down_lidar->points[i];
+        PointType &point_world = m_cloud_down_world->points[i];
+        Eigen::Vector3d point_body_vec(point_body.x, point_body.y, point_body.z);
+        Eigen::Vector3d point_world_vec = state.r_wi * (state.r_il * point_body_vec + state.t_il) + state.t_wi;
+        point_world.x = point_world_vec(0);
+        point_world.y = point_world_vec(1);
+        point_world.z = point_world_vec(2);
+        point_world.intensity = point_body.intensity;
+        std::vector<float> point_sq_dist(m_config.near_search_num);
+        auto &points_near = m_nearest_points[i];
+        m_ikdtree->Nearest_Search(point_world, m_config.near_search_num, points_near, point_sq_dist);
+        if (points_near.size() >= static_cast<size_t>(m_config.near_search_num) && point_sq_dist[m_config.near_search_num - 1] <= 5)
+            m_point_selected_flag[i] = true;
+        else
+            m_point_selected_flag[i] = false;
+        if (!m_point_selected_flag[i])
+            continue;
+
+        Eigen::Vector4d pabcd;
+        m_point_selected_flag[i] = false;
+        if (esti_plane(points_near, m_config.plane_thr, pabcd))
+        {
+            double pd2 = pabcd(0) * point_world_vec(0) + pabcd(1) * point_world_vec(1) + pabcd(2) * point_world_vec(2) + pabcd(3);
+            double s = 1 - 0.9 * std::fabs(pd2) / std::sqrt(point_body_vec.norm());
+            if (s > 0.9)
+            {
+                m_point_selected_flag[i] = true;
+                m_norm_vec->points[i].x = pabcd(0);
+                m_norm_vec->points[i].y = pabcd(1);
+                m_norm_vec->points[i].z = pabcd(2);
+                m_norm_vec->points[i].intensity = pd2;
+            }
+        }
+    }
+
+    int effect_num = 0;
+    for (int i = begin; i < end; i++)
+    {
+        if (!m_point_selected_flag[i])
+            continue;
+        const PointType &laser_p = m_cloud_down_lidar->points[i];
+        const PointType &norm_p = m_norm_vec->points[i];
+        Eigen::Vector3d laser_p_vec(laser_p.x, laser_p.y, laser_p.z);
+        Eigen::Vector3d norm_vec(norm_p.x, norm_p.y, norm_p.z);
+        m_H.row(effect_num).setZero();
+        m_H.block<1, 3>(effect_num, 0) = -norm_vec.transpose() * state.r_wi * Sophus::SO3d::hat(state.r_il * laser_p_vec + state.t_il);
+        m_H.block<1, 3>(effect_num, 3) = norm_vec.transpose();
+        if (m_config.esti_il)
+        {
+            m_H.block<1, 3>(effect_num, 6) = -norm_vec.transpose() * state.r_wi * state.r_il * Sophus::SO3d::hat(laser_p_vec);
+            m_H.block<1, 3>(effect_num, 9) = norm_vec.transpose() * state.r_wi;
+        }
+        m_z(effect_num) = norm_p.intensity;
+        effect_num++;
+    }
+    if (effect_num < 1)
+        return;
+
+    m_kf->updateLidar(m_H, m_z, effect_num);
+
+    // 用更新後的狀態重轉這個 chunk 的 world 座標，供 incrCloudMap 插入地圖
+    const State &post = m_kf->x();
+    for (int i = begin; i < end; i++)
+    {
+        const PointType &point_body = m_cloud_down_lidar->points[i];
+        Eigen::Vector3d point_body_vec(point_body.x, point_body.y, point_body.z);
+        Eigen::Vector3d point_world_vec = post.r_wi * (post.r_il * point_body_vec + post.t_il) + post.t_wi;
+        m_cloud_down_world->points[i].x = point_world_vec(0);
+        m_cloud_down_world->points[i].y = point_world_vec(1);
+        m_cloud_down_world->points[i].z = point_world_vec(2);
+    }
+}
+
+CloudType::Ptr LidarProcessor::transformCloud(CloudType::Ptr inp, const M3D &r, const V3D &t)
+{
+    Eigen::Matrix4f transform = Eigen::Matrix4f::Identity();
+    transform.block<3, 3>(0, 0) = r.cast<float>();
+    transform.block<3, 1>(0, 3) = t.cast<float>();
+    CloudType::Ptr ret(new CloudType);
+    pcl::transformPointCloud(*inp, *ret, transform);
+    return ret;
+}

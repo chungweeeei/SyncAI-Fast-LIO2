@@ -1,0 +1,69 @@
+# Point-LIO config for Isaac Sim — PointCloud2 lidar input.
+# Differs from pointlio.yaml (real Livox) in: lidar_type, imu_acc_scale,
+# topics, frames, and identity lidar->imu extrinsic (co-located in sim).
+#
+# NOTE: Isaac's PointCloud2 has no per-point timestamps (pc2ToPCL sets
+# curvature = 0), so Point-LIO's point-by-point update degenerates into ONE
+# batch update per scan and loses its distortion-free advantage. For Isaac,
+# fastlio2 remains the recommended estimator; this variant mainly serves
+# pipeline-parity testing until the sim publishes a per-point time field.
+#
+# NOTE: the Isaac launch (pointlio_isaac_launch.py) rewrites imu_topic /
+# lidar_topic / body_frame / world_frame with the <robot_id> read from
+# config/system.ini into a generated file under /tmp — the values below are
+# only fallbacks for running without that launch.
+imu_topic: /robot06/livox/imu
+lidar_topic: /robot06/livox/lidar
+
+# Standalone frames so pointlio_node's world->body TF broadcast does NOT
+# collide with robot_state_publisher. The launch prefixes these with
+# <robot_id>/ (e.g. robot06/pointlio_odom). Distinct from fastlio2's
+# lio_odom/lio_body so both estimators can run side by side for A/B tests.
+body_frame: pointlio_body
+world_frame: pointlio_odom
+print_time_cost: false
+
+# 0: livox CustomMsg (default), 1: sensor_msgs/PointCloud2 (Isaac Sim)
+lidar_type: 1
+# Isaac IMU accel is already m/s^2 (z~9.81 at rest); do NOT apply the Livox g->m/s^2 x10.
+imu_acc_scale: 1.0
+
+lidar_filter_num: 3
+lidar_min_range: 0.5
+lidar_max_range: 30.0
+scan_resolution: 0.25
+map_resolution: 0.3
+
+cube_len: 300
+det_range: 60
+move_thresh: 1.5
+
+# process noise driving the omg/acc random-walk states
+gyr_cov_output: 1000.0
+acc_cov_output: 500.0
+b_gyr_cov: 0.0001
+b_acc_cov: 0.0001
+
+# IMU-as-measurement noise
+imu_meas_omg_cov: 0.1
+imu_meas_acc_cov: 0.1
+
+# saturation thresholds (satu_acc in m/s^2 after imu_acc_scale)
+satu_gyro: 35.0
+satu_acc: 30.0
+
+# point-to-plane measurement
+lidar_meas_cov: 0.01
+plane_thr: 0.1
+# whole Isaac scan is one timestamp group -> chunked into batches of this size
+batch_max_points: 500
+
+imu_init_num: 20
+near_search_num: 5
+
+gravity_align: true
+esti_il: false
+
+# IMU co-located with lidar prim in sim -> identity extrinsic.
+r_il: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+t_il: [0.0, 0.0, 0.0]
