@@ -120,11 +120,13 @@ public:
     m_localizer_config.rough_map_resolution = config["rough_map_resolution"].as<double>();
     m_localizer_config.rough_max_iteration = config["rough_max_iteration"].as<int>();
     m_localizer_config.rough_score_thresh = config["rough_score_thresh"].as<double>();
+    m_localizer_config.rough_max_corr_dist = config["rough_max_corr_dist"].as<double>();
 
     m_localizer_config.refine_scan_resolution = config["refine_scan_resolution"].as<double>();
     m_localizer_config.refine_map_resolution = config["refine_map_resolution"].as<double>();
     m_localizer_config.refine_max_iteration = config["refine_max_iteration"].as<int>();
     m_localizer_config.refine_score_thresh = config["refine_score_thresh"].as<double>();
+    m_localizer_config.refine_max_corr_dist = config["refine_max_corr_dist"].as<double>();
   }
 
   void timerCB()

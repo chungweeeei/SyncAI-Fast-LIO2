@@ -8,8 +8,12 @@ rough_scan_resolution: 0.25
 rough_map_resolution: 0.25
 rough_max_iteration: 5
 rough_score_thresh: 0.2
+# correspondence 配對距離上限（m）：rough 給大一點吸收 relocalize 手動 guess 的誤差
+rough_max_corr_dist: 2.0
 
 refine_scan_resolution: 0.1
 refine_map_resolution: 0.1
 refine_max_iteration: 10
 refine_score_thresh: 0.1
+# refine 收緊，只用近距離配對做精配
+refine_max_corr_dist: 0.5

@@ -12,11 +12,13 @@ struct ICPConfig
     double refine_map_resolution = 0.1;
     double refine_score_thresh = 0.1;
     int refine_max_iteration = 10;
+    double refine_max_corr_dist = 0.5;
 
     double rough_scan_resolution = 0.25;
     double rough_map_resolution = 0.25;
     double rough_score_thresh = 0.2;
     int rough_max_iteration = 5;
+    double rough_max_corr_dist = 2.0;
 };
 
 class ICPLocalizer
