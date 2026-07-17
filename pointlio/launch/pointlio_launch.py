@@ -14,7 +14,6 @@ def generate_launch_description():
         [FindPackageShare("pointlio"), "config", "pointlio.yaml"]
     )
 
-
     return launch.LaunchDescription(
         [
             launch_ros.actions.Node(
@@ -23,15 +22,17 @@ def generate_launch_description():
                 executable="pointlio_node",
                 name="pointlio_node",
                 output="screen",
-                parameters=[{"config_path": config_path.perform(launch.LaunchContext())}]
+                parameters=[
+                    {"config_path": config_path.perform(launch.LaunchContext())}
+                ],
             ),
-            launch_ros.actions.Node(
-                package="rviz2",
-                namespace="pointlio",
-                executable="rviz2",
-                name="rviz2",
-                output="screen",
-                arguments=["-d", rviz_cfg.perform(launch.LaunchContext())],
-            ),
+            # launch_ros.actions.Node(
+            #     package="rviz2",
+            #     namespace="pointlio",
+            #     executable="rviz2",
+            #     name="rviz2",
+            #     output="screen",
+            #     arguments=["-d", rviz_cfg.perform(launch.LaunchContext())],
+            # ),
         ]
     )

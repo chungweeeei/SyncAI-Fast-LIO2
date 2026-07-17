@@ -2,8 +2,8 @@
 # odom_topic / local_frame with the <robot_id>/ prefix read from
 # config/system.ini; these plain values only apply when launched via the
 # original pgo_launch.py.
-cloud_topic: /fastlio2/body_cloud
-odom_topic: /fastlio2/lio_odom
+cloud_topic: /pointlio/body_cloud
+odom_topic: /pointlio/lio_odom
 map_frame: map
 # LIO world frame that pgo's map->local_frame TF should correct
 # (matches lio_isaac.yaml world_frame; original upstream value was "lidar").
