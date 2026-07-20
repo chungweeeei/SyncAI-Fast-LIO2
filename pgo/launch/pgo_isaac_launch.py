@@ -1,14 +1,3 @@
-# Isaac Sim variant of the PGO (mapping + loop closure) launch.
-#
-# Starts lio_node (Isaac config) + pgo_node, all namespaced with the robot_id
-# read from the system config INI (same convention as the syncai_* launches):
-#   /<robot_id>/fastlio2/...  (body_cloud, lio_odom, ...)
-#   /<robot_id>/pgo/...       (save_maps service, loop markers, ...)
-#   frames: map -> <robot_id>/lio_odom -> <robot_id>/lio_body
-# Both nodes read topics/frames from their own YAMLs (absolute names, not
-# affected by ROS namespaces), so the launch rewrites them with the robot_id
-# prefix into generated files under /tmp before starting.
-
 import configparser
 import os
 import tempfile

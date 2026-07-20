@@ -1,7 +1,7 @@
 pcd_publisher:
   ros__parameters:
     # Absolute path to the .pcd file to visualize.
-    pcd_path: "/home/ubuntu/robot_ws/map/dp2f/map.pcd"
+    pcd_path: "map/dp2f/map.pcd"
     # TF frame the cloud is published in (match your RViz Fixed Frame).
     frame_id: "map"
     # Topic to publish the PointCloud2 on. Uses transient_local QoS and

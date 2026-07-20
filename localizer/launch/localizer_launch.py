@@ -5,26 +5,28 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-    rviz_cfg = PathJoinSubstitution(
-        [FindPackageShare("localizer"), "rviz", "localizer.rviz"]
-    )
     localizer_config_path = PathJoinSubstitution(
         [FindPackageShare("localizer"), "config", "localizer.yaml"]
     )
 
-    lio_config_path = PathJoinSubstitution(
-        [FindPackageShare("fastlio2"), "config", "lio.yaml"]
+    point_lio_config_path = PathJoinSubstitution(
+        [FindPackageShare("pointlio"), "config", "pointlio.yaml"]
     )
+
     return launch.LaunchDescription(
         [
             launch_ros.actions.Node(
-                package="fastlio2",
-                namespace="fastlio2",
-                executable="lio_node",
-                name="lio_node",
+                package="pointlio",
+                namespace="pointlio",
+                executable="pointlio_node",
+                name="pointlio_node",
                 output="screen",
                 parameters=[
-                    {"config_path": lio_config_path.perform(launch.LaunchContext())}
+                    {
+                        "config_path": point_lio_config_path.perform(
+                            launch.LaunchContext()
+                        )
+                    }
                 ],
             ),
             launch_ros.actions.Node(
@@ -41,13 +43,5 @@ def generate_launch_description():
                     }
                 ],
             ),
-            launch_ros.actions.Node(
-                package="rviz2",
-                namespace="localizer",
-                executable="rviz2",
-                name="rviz2",
-                output="screen",
-                arguments=["-d", rviz_cfg.perform(launch.LaunchContext())],
-            )
         ]
     )
