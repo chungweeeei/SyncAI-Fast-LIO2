@@ -73,6 +73,25 @@ def launch_setup(context, *args, **kwargs):
     robot_id = read_robot_id(config_path)
     pointlio_config = generate_pointlio_config(robot_id)
 
+    # Bag replay: rosbags recorded before the robot_id topic prefix existed
+    # carry the raw Livox topics (/livox/lidar, /livox/imu). The node
+    # subscribes to the prefixed names from its YAML (/<robot_id>/livox/...),
+    # so remap those fully-qualified subscriptions onto the bag topics. Off by
+    # default so a real robot (driver publishes the prefixed topics) is
+    # unaffected; enable with `bag_topics:=true`.
+    bag_topics = LaunchConfiguration("bag_topics").perform(context).lower() in (
+        "true",
+        "1",
+    )
+    remappings = (
+        [
+            (f"/{robot_id}/livox/lidar", "/livox/lidar"),
+            (f"/{robot_id}/livox/imu", "/livox/imu"),
+        ]
+        if bag_topics
+        else []
+    )
+
     return [
         launch_ros.actions.Node(
             package="pointlio",
@@ -80,6 +99,7 @@ def launch_setup(context, *args, **kwargs):
             executable="pointlio_node",
             name="pointlio_node",
             output="screen",
+            remappings=remappings,
             parameters=[{"config_path": pointlio_config}],
         ),
     ]
@@ -97,6 +117,15 @@ def generate_launch_description():
                 "rviz",
                 default_value="true",
                 description="Launch RViz to watch the map being built",
+            ),
+            DeclareLaunchArgument(
+                "bag_topics",
+                default_value="true",
+                description=(
+                    "Remap the node's /<robot_id>/livox/{lidar,imu} "
+                    "subscriptions onto the raw /livox/{lidar,imu} topics for "
+                    "replaying rosbags recorded without the robot_id prefix"
+                ),
             ),
             OpaqueFunction(function=launch_setup),
         ]
