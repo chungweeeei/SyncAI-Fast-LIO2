@@ -177,8 +177,14 @@ public:
       M3D map_body_r = initial_guess.block<3, 3>(0, 0).cast<double>();
       V3D map_body_t = initial_guess.block<3, 1>(0, 3).cast<double>();
       m_state.last_offset_r = map_body_r * current_local_r.transpose();
-      m_state.last_offset_t =
-        -map_body_r * current_local_r.transpose() * current_local_t + map_body_t;
+      // 重正交化：ICP 解與 odom 旋轉是 float 連乘（下一輪還會回饋進 initial_guess），
+      // 誤差累積會讓 R 偏離 SO(3)，broadcast 時轉成 quaternion 的 norm 就會漂移
+      // （tf2 denormalized-quaternion warning，且 skew/scale 被當成假位移）。拉回合法旋轉。
+      Eigen::Quaterniond offset_q(m_state.last_offset_r);
+      offset_q.normalize();
+      m_state.last_offset_r = offset_q.toRotationMatrix();
+      // 平移用同一個已正交化的 last_offset_r，保持旋轉/平移一致
+      m_state.last_offset_t = -m_state.last_offset_r * current_local_t + map_body_t;
       std::lock_guard<std::mutex> lock(m_state.service_mutex);
       if (!m_state.localize_success && m_state.service_received) {
         m_state.localize_success = true;
