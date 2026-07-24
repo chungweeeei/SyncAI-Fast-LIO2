@@ -156,7 +156,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /initialpose
+        Value: /localizer/initialpose
     - Class: rviz_default_plugins/SetGoal
       Topic:
         Depth: 5

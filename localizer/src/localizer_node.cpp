@@ -1,4 +1,5 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <message_filters/subscriber.h>
 #include <message_filters/sync_policies/approximate_time.h>
 #include <message_filters/synchronizer.h>
@@ -26,6 +27,9 @@ struct NodeConfig
   std::string odom_topic = "/fastlio2/lio_odom";
   std::string map_frame = "map";
   std::string local_frame = "lidar";
+  // 相對名：繼承 node namespace（/<robot_id>/localizer/initialpose），
+  // 與 relocalize service 同一層
+  std::string initialpose_topic = "initialpose";
   double update_hz = 1.0;
 };
 
@@ -90,6 +94,13 @@ public:
       std::bind(&LocalizerNode::relocCheckCB, this, std::placeholders::_1, std::placeholders::_2),
       rmw_qos_profile_services_default, m_srv_cb_group);
 
+    // RViz「2D Pose Estimate」等來源的 initial guess：走 relocalize 同一條
+    // initial_guess 路徑（下一輪 timerCB 拿去餵 ICP），但不重載地圖，
+    // 所以地圖還沒透過 relocalize 載入前發這個 topic 不會有效果
+    m_initialpose_sub = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+      m_config.initialpose_topic, 10,
+      std::bind(&LocalizerNode::initialPoseCB, this, std::placeholders::_1));
+
     // 地圖是靜態的：transient_local（latched）+ loadMap 成功後發一次，
     // 晚連上的訂閱者也收得到（RViz 端的 QoS 也要設成 transient_local）
     m_map_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -114,6 +125,9 @@ public:
     m_config.odom_topic = config["odom_topic"].as<std::string>();
     m_config.map_frame = config["map_frame"].as<std::string>();
     m_config.local_frame = config["local_frame"].as<std::string>();
+    // 選填：沒設就用相對名 initialpose（吃 node namespace）
+    if (config["initialpose_topic"])
+      m_config.initialpose_topic = config["initialpose_topic"].as<std::string>();
     m_config.update_hz = config["update_hz"].as<double>();
 
     m_localizer_config.rough_scan_resolution = config["rough_scan_resolution"].as<double>();
@@ -281,6 +295,31 @@ public:
     return;
   }
 
+  void initialPoseCB(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
+  {
+    if (!msg->header.frame_id.empty() && msg->header.frame_id != m_config.map_frame) {
+      RCLCPP_WARN(
+        this->get_logger(), "initialpose frame_id '%s' != map_frame '%s', treating it as %s",
+        msg->header.frame_id.c_str(), m_config.map_frame.c_str(), m_config.map_frame.c_str());
+    }
+
+    Eigen::Quaternionf q(
+      msg->pose.pose.orientation.w, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y,
+      msg->pose.pose.orientation.z);
+    q.normalize();
+
+    std::lock_guard<std::mutex> lock(m_state.service_mutex);
+    m_state.initial_guess.setIdentity();
+    m_state.initial_guess.block<3, 3>(0, 0) = q.toRotationMatrix();
+    m_state.initial_guess.block<3, 1>(0, 3) = V3F(
+      msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
+    m_state.service_received = true;
+    m_state.localize_success = false;
+    RCLCPP_INFO(
+      this->get_logger(), "initialpose received: x=%.3f y=%.3f z=%.3f",
+      msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
+  }
+
   void relocCheckCB(
     const std::shared_ptr<interface::srv::IsValid::Request> request,
     std::shared_ptr<interface::srv::IsValid::Response> response)
@@ -320,6 +359,7 @@ private:
   rclcpp::CallbackGroup::SharedPtr m_srv_cb_group;
   rclcpp::Service<interface::srv::Relocalize>::SharedPtr m_reloc_srv;
   rclcpp::Service<interface::srv::IsValid>::SharedPtr m_reloc_check_srv;
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr m_initialpose_sub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_map_cloud_pub;
 };
 int main(int argc, char ** argv)

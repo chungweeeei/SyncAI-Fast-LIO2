@@ -2,6 +2,9 @@ cloud_topic: /pointlio/body_cloud
 odom_topic: /pointlio/lio_odom
 map_frame: map
 local_frame: laser
+# initial guess 來源（RViz 2D Pose Estimate 等）。相對名會繼承 node namespace，
+# 實際 topic 為 /<robot_id>/localizer/initialpose
+initialpose_topic: initialpose
 update_hz: 1.0
 
 rough_scan_resolution: 0.25
