@@ -4,7 +4,7 @@
 # as pointlio_isaac_launch.py) and is used as the node namespace and as the
 # prefix for both the sensor topics and the TF frames:
 #   topics: /<robot_id>/livox/lidar, /<robot_id>/livox/imu
-#   frames: <robot_id>/laser -> <robot_id>/base_link
+#   frames: <robot_id>/pointlio_odom -> <robot_id>/pointlio_body
 # pointlio_node reads topics/frames from its own YAML (absolute names, not
 # affected by ROS namespaces), so the launch rewrites pointlio.yaml with the
 # robot_id prefix into a generated file under /tmp before starting.
@@ -57,8 +57,24 @@ def generate_pointlio_config(robot_id: str) -> str:
         cfg = yaml.safe_load(f)
     cfg["lidar_topic"] = f"/{robot_id}/livox/lidar"
     cfg["imu_topic"] = f"/{robot_id}/livox/imu"
-    cfg["world_frame"] = f"{robot_id}/laser"
-    cfg["body_frame"] = f"{robot_id}/base_link"
+    # Standalone frames, matching pointlio_isaac.yaml's reasoning: these must
+    # NOT be <robot_id>/laser -> <robot_id>/base_link, which is what they used
+    # to be. base_link is already claimed as a TF child by syncai_lio_bridge
+    # (odom -> base_link), so naming pointlio's body frame base_link gave that
+    # frame two parents. tf2 keys its cache by CHILD frame, so the two
+    # broadcasters' samples interleaved in one cache and the parent you got
+    # back depended on the lookup time: latest (Time()) hit lio_bridge's 20 Hz
+    # samples, the cloud's own stamp hit pointlio's 10 Hz ones. That silently
+    # sent the backend's body_cloud transform through lio_bridge's 2D-projected
+    # chain (z == 0, roll == pitch == 0) while rviz2, which looks up at the
+    # message stamp, went through the full 6DOF chain — a ~15 deg pitch
+    # disagreement between rviz2 and the operator UI.
+    #
+    # The rename also stops body_frame from lying: Point-LIO's body frame is
+    # physically the lidar, not base_link (syncai_lio_bridge relies on exactly
+    # that — see the lidar->base correction in its timer_cb).
+    cfg["world_frame"] = f"{robot_id}/pointlio_odom"
+    cfg["body_frame"] = f"{robot_id}/pointlio_body"
     generated = tempfile.NamedTemporaryFile(
         mode="w", prefix=f"pointlio_{robot_id}_", suffix=".yaml", delete=False
     )

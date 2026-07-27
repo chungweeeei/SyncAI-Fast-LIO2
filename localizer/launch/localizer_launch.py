@@ -68,8 +68,14 @@ def generate_pointlio_config(robot_id: str) -> str:
         cfg = yaml.safe_load(f)
     cfg["lidar_topic"] = f"/{robot_id}/livox/lidar"
     cfg["imu_topic"] = f"/{robot_id}/livox/imu"
-    cfg["world_frame"] = f"{robot_id}/laser"
-    cfg["body_frame"] = f"{robot_id}/base_link"
+    # Standalone frames — must stay in sync with pointlio_launch.py, which
+    # carries the full rationale. Short version: naming the body frame
+    # base_link gave that frame two TF parents (syncai_lio_bridge also
+    # broadcasts odom -> base_link), so which chain a lookup resolved through
+    # depended on the query time, and the backend's body_cloud silently went
+    # through lio_bridge's 2D-projected chain instead of the 6DOF LIO one.
+    cfg["world_frame"] = f"{robot_id}/pointlio_odom"
+    cfg["body_frame"] = f"{robot_id}/pointlio_body"
     generated = tempfile.NamedTemporaryFile(
         mode="w", prefix=f"pointlio_{robot_id}_", suffix=".yaml", delete=False
     )
