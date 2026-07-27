@@ -42,6 +42,13 @@ public:
         std::lock_guard<std::mutex> lock(m_target_mutex);
         return m_refine_tgt;
     }
+    // 地圖只會透過 relocalize 的 loadMap() 進來；載入前 align() 一律失敗，
+    // initialpose 等來源可先用這個判斷，避免無聲吞掉 guess
+    bool isMapLoaded()
+    {
+        std::lock_guard<std::mutex> lock(m_target_mutex);
+        return !m_refine_tgt->empty() && !m_rough_tgt->empty();
+    }
 
 
 private:

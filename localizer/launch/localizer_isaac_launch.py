@@ -53,6 +53,17 @@ def read_robot_id(config_path: str) -> str:
     return robot_id
 
 
+def read_map_pcd(config_path: str) -> str:
+    """[map] pcd from the system INI — the PCD the localizer should load when
+    it receives an initialpose before any relocalize (e.g. right after a
+    restart). Empty string if not configured; initialpose then requires a
+    prior relocalize call."""
+    config = configparser.ConfigParser()
+    if not config.read(config_path):
+        return ""
+    return config.get("map", "pcd", fallback="").strip()
+
+
 def launch_setup(context, *args, **kwargs):
     config_path = LaunchConfiguration("system_config").perform(context)
     robot_id = read_robot_id(config_path)
@@ -91,6 +102,17 @@ def launch_setup(context, *args, **kwargs):
         localizer_config = yaml.safe_load(f)
     localizer_config["cloud_topic"] = f"/{robot_id}/fastlio2/body_cloud"
     localizer_config["odom_topic"] = f"/{robot_id}/fastlio2/lio_odom"
+    map_pcd = read_map_pcd(config_path)
+    if map_pcd:
+        # INI 裡是相對 workspace root 的路徑（processes 以 workspace root 為
+        # cwd 的慣例）；launch 也在 workspace root 跑，這裡轉絕對路徑，
+        # 讓 node 不依賴自己的 cwd
+        localizer_config["map_path"] = os.path.abspath(map_pcd)
+    else:
+        logger.warning(
+            "No [map] pcd in the system INI; initialpose will only work "
+            "after a relocalize call has loaded the map"
+        )
     generated = tempfile.NamedTemporaryFile(
         mode="w",
         prefix=f"localizer_{robot_id}_",

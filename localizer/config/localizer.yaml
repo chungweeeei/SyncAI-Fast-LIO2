@@ -5,6 +5,9 @@ local_frame: laser
 # initial guess 來源（RViz 2D Pose Estimate 等）。相對名會繼承 node namespace，
 # 實際 topic 為 /<robot_id>/localizer/initialpose
 initialpose_topic: initialpose
+# map_path（選填）：initialpose 在地圖尚未載入時自動 loadMap 用的 PCD。
+# 這裡不設值——launch 會從 system.ini 的 [map] pcd 注入絕對路徑；
+# 沒設定時 initialpose 需要先跑過一次 relocalize 才有效
 update_hz: 1.0
 
 rough_scan_resolution: 0.25

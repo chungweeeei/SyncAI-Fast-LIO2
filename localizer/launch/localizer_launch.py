@@ -48,6 +48,17 @@ def read_robot_id(config_path: str) -> str:
     return robot_id
 
 
+def read_map_pcd(config_path: str) -> str:
+    """[map] pcd from the system INI — the PCD the localizer should load when
+    it receives an initialpose before any relocalize (e.g. right after a
+    restart). Empty string if not configured; initialpose then requires a
+    prior relocalize call."""
+    config = configparser.ConfigParser()
+    if not config.read(config_path):
+        return ""
+    return config.get("map", "pcd", fallback="").strip()
+
+
 def generate_pointlio_config(robot_id: str) -> str:
     """Rewrite pointlio.yaml topics/frames with the robot_id prefix and
     return the path of the generated file."""
@@ -68,7 +79,7 @@ def generate_pointlio_config(robot_id: str) -> str:
     return generated.name
 
 
-def generate_localizer_config(robot_id: str) -> str:
+def generate_localizer_config(robot_id: str, map_pcd: str) -> str:
     """Rewrite localizer.yaml input topics to follow pointlio's namespace and
     return the path of the generated file. local_frame needs no rewrite - the
     node adopts the frame_id of the first odom message automatically."""
@@ -78,6 +89,16 @@ def generate_localizer_config(robot_id: str) -> str:
         cfg = yaml.safe_load(f)
     cfg["cloud_topic"] = f"/{robot_id}/pointlio/body_cloud"
     cfg["odom_topic"] = f"/{robot_id}/pointlio/lio_odom"
+    if map_pcd:
+        # INI 裡是相對 workspace root 的路徑（processes 以 workspace root 為
+        # cwd 的慣例）；launch 也在 workspace root 跑，這裡轉絕對路徑，
+        # 讓 node 不依賴自己的 cwd
+        cfg["map_path"] = os.path.abspath(map_pcd)
+    else:
+        logger.warning(
+            "No [map] pcd in the system INI; initialpose will only work "
+            "after a relocalize call has loaded the map"
+        )
     generated = tempfile.NamedTemporaryFile(
         mode="w", prefix=f"localizer_{robot_id}_", suffix=".yaml", delete=False
     )
@@ -92,7 +113,7 @@ def launch_setup(context, *args, **kwargs):
     robot_id = read_robot_id(config_path)
 
     pointlio_config = generate_pointlio_config(robot_id)
-    localizer_config = generate_localizer_config(robot_id)
+    localizer_config = generate_localizer_config(robot_id, read_map_pcd(config_path))
 
     return [
         launch_ros.actions.Node(

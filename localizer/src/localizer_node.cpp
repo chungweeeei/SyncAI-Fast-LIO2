@@ -10,6 +10,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <yaml-cpp/yaml.h>
 
+#include <cmath>
 #include <filesystem>
 #include <mutex>
 #include <queue>
@@ -30,6 +31,10 @@ struct NodeConfig
   // 相對名：繼承 node namespace（/<robot_id>/localizer/initialpose），
   // 與 relocalize service 同一層
   std::string initialpose_topic = "initialpose";
+  // system.ini 的 [map] pcd，由 launch 寫進產生的 yaml。initialpose 在地圖
+  // 尚未載入時（localizer 重啟後還沒跑過 relocalize）用它自動 loadMap；
+  // 空字串表示沒設定，此時 initialpose 只能在 relocalize 之後使用
+  std::string map_path = "";
   double update_hz = 1.0;
 };
 
@@ -95,11 +100,16 @@ public:
       rmw_qos_profile_services_default, m_srv_cb_group);
 
     // RViz「2D Pose Estimate」等來源的 initial guess：走 relocalize 同一條
-    // initial_guess 路徑（下一輪 timerCB 拿去餵 ICP），但不重載地圖，
-    // 所以地圖還沒透過 relocalize 載入前發這個 topic 不會有效果
+    // initial_guess 路徑（下一輪 timerCB 拿去餵 ICP）。地圖已載入時不重載；
+    // 還沒載入（localizer 重啟後）則用 config 的 map_path 自動 loadMap。
+    // 因為可能 loadMap（耗時數秒），跟 services 放同一個 callback group，
+    // 才不會卡住 timer 那組的 TF 重播
+    rclcpp::SubscriptionOptions initialpose_options;
+    initialpose_options.callback_group = m_srv_cb_group;
     m_initialpose_sub = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       m_config.initialpose_topic, 10,
-      std::bind(&LocalizerNode::initialPoseCB, this, std::placeholders::_1));
+      std::bind(&LocalizerNode::initialPoseCB, this, std::placeholders::_1),
+      initialpose_options);
 
     // 地圖是靜態的：transient_local（latched）+ loadMap 成功後發一次，
     // 晚連上的訂閱者也收得到（RViz 端的 QoS 也要設成 transient_local）
@@ -128,6 +138,8 @@ public:
     // 選填：沒設就用相對名 initialpose（吃 node namespace）
     if (config["initialpose_topic"])
       m_config.initialpose_topic = config["initialpose_topic"].as<std::string>();
+    // 選填：沒設就維持空字串（initialpose 不會自動載地圖）
+    if (config["map_path"]) m_config.map_path = config["map_path"].as<std::string>();
     m_config.update_hz = config["update_hz"].as<double>();
 
     m_localizer_config.rough_scan_resolution = config["rough_scan_resolution"].as<double>();
@@ -297,27 +309,77 @@ public:
 
   void initialPoseCB(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
   {
+    // 地圖沒載入時 align() 在空 target 上直接 return false（連 guess 都不會
+    // log），initialpose 看起來就像完全沒反應——實機上 localizer 重啟後先拉
+    // initialpose 就是這樣中招的。所以這裡補上 relocalize 的另一半：用
+    // system.ini 帶進來的 map_path 自動載圖；沒設定就明確警告並忽略，
+    // 不留下一個等地圖載入後才生效的過期 guess。
+    if (!m_localizer->isMapLoaded()) {
+      if (m_config.map_path.empty() || !std::filesystem::exists(m_config.map_path)) {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "initialpose ignored: map not loaded and map_path '%s' not usable — "
+          "call the relocalize service first",
+          m_config.map_path.c_str());
+        return;
+      }
+      RCLCPP_INFO(
+        this->get_logger(), "initialpose with no map loaded: loading map from %s",
+        m_config.map_path.c_str());
+      if (!m_localizer->loadMap(m_config.map_path)) {
+        RCLCPP_WARN(
+          this->get_logger(), "initialpose ignored: failed to load map from %s",
+          m_config.map_path.c_str());
+        return;
+      }
+      builtin_interfaces::msg::Time stamp = this->now();
+      publishMapCloud(stamp);
+    }
+
     if (!msg->header.frame_id.empty() && msg->header.frame_id != m_config.map_frame) {
       RCLCPP_WARN(
         this->get_logger(), "initialpose frame_id '%s' != map_frame '%s', treating it as %s",
         msg->header.frame_id.c_str(), m_config.map_frame.c_str(), m_config.map_frame.c_str());
     }
 
-    Eigen::Quaternionf q(
+    Eigen::Quaterniond q(
       msg->pose.pose.orientation.w, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y,
       msg->pose.pose.orientation.z);
     q.normalize();
 
+    // 2D 來源（RViz 2D Pose Estimate、前端 gridmap）只給得出 x, y, yaw
+    // （z=0、roll=pitch=0）。但雷達斜裝 + map 重力對齊時，map_T_body 恆帶
+    // ~15° 的 mount pitch：直接拿 msg 姿態當 guess 會讓 scan 相對地圖整體
+    // 傾斜，遠處點的誤差超過 rough_max_corr_dist，rough ICP 永遠過不了
+    // score 門檻——而 pending 期間 timerCB 又跳過 odom 回饋路徑，定位就
+    // 凍在舊 offset 上無限重試（實機在 (5.0, 0.982) 發 initialpose 卡死，
+    // 補上 14.6° pitch 後同一位置第一輪就收斂）。
+    // 所以只取 msg 的 x, y, yaw；roll/pitch/z 從目前估計補齊。
+    M3D guess_r = q.toRotationMatrix();
+    V3D guess_t(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
+    {
+      std::lock_guard<std::mutex> lock(m_state.message_mutex);
+      if (m_state.message_received) {
+        M3D cur_r = m_state.last_offset_r * m_state.last_r;
+        V3D cur_t = m_state.last_offset_r * m_state.last_t + m_state.last_offset_t;
+        double msg_yaw = std::atan2(guess_r(1, 0), guess_r(0, 0));
+        double cur_yaw = std::atan2(cur_r(1, 0), cur_r(0, 0));
+        // 保留目前姿態的重力傾角，只把 heading 轉到 msg 的 yaw
+        guess_r = Eigen::AngleAxisd(msg_yaw - cur_yaw, V3D::UnitZ()).toRotationMatrix() * cur_r;
+        guess_t.z() = cur_t.z();
+      }
+      // 開機初期還沒收到任何 odom 時沒有估計可補，msg 原樣用
+    }
+
     std::lock_guard<std::mutex> lock(m_state.service_mutex);
     m_state.initial_guess.setIdentity();
-    m_state.initial_guess.block<3, 3>(0, 0) = q.toRotationMatrix();
-    m_state.initial_guess.block<3, 1>(0, 3) = V3F(
-      msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
+    m_state.initial_guess.block<3, 3>(0, 0) = guess_r.cast<float>();
+    m_state.initial_guess.block<3, 1>(0, 3) = guess_t.cast<float>();
     m_state.service_received = true;
     m_state.localize_success = false;
     RCLCPP_INFO(
-      this->get_logger(), "initialpose received: x=%.3f y=%.3f z=%.3f",
-      msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
+      this->get_logger(), "initialpose received: x=%.3f y=%.3f z=%.3f (yaw from msg, roll/pitch/z from current estimate)",
+      guess_t.x(), guess_t.y(), guess_t.z());
   }
 
   void relocCheckCB(
