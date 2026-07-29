@@ -6,14 +6,20 @@
 #   /<robot_id>/pointlio/...   (body_cloud, lio_odom, ...)
 #   /<robot_id>/localizer/...  (relocalize, relocalize_check, map_cloud)
 #
-# The two nodes configure themselves differently:
-#   * localizer takes standard ROS 2 parameters — config/localizer.yaml is a
-#     /**/localizer_node params file, and the robot_id-dependent values
-#     (pointlio's topics, the map PCD path) are passed as a second parameters
-#     dict that overrides the file. No generated files involved.
-#   * pointlio still reads its own flat YAML through a config_path parameter
-#     (absolute topic/frame names, unaffected by ROS namespaces), so the launch
-#     keeps rewriting that one with the robot_id prefix into /tmp.
+# localizer takes standard ROS 2 parameters — config/localizer.yaml is a
+# /**/localizer_node params file, and the robot_id-dependent values (pointlio's
+# topics, the map PCD path) are passed as a second parameters dict that overrides
+# the file. No generated files involved.
+#
+# pointlio is NOT declared here — this launch includes pointlio_launch.py. It
+# used to spawn pointlio_node itself with a `config_path` parameter pointing at a
+# /tmp rewrite of pointlio.yaml, which是 pointlio_node 還自己用 yaml-cpp 解析
+# 設定檔的年代留下來的。那個 node 早就改成純 ROS parameters + 相對 topic 名稱
+# ("lidar" / "imu") 加 launch remapping，於是這裡的 config_path 變成一個沒人讀的
+# 參數：pointlio 全套調參退回 struct defaults，訂閱退回相對名稱解出來的
+# /<robot_id>/pointlio/{lidar,imu}（沒有任何 publisher），LIO 收不到一筆資料，
+# 不發 odom / body_cloud / TF，localizer 也就永遠沒有輸入可以定位。
+# 用 include 而不是複製一份 Node 定義，就是為了不再有第二份會走鐘的定義。
 #
 # The [map] pcd from the same INI is mandatory: the localizer loads it during
 # construction, so a missing file means neither node starts. The optional
@@ -23,14 +29,16 @@
 
 import configparser
 import os
-import tempfile
-
-import yaml
 
 import launch
 import launch_ros.actions
 from launch import logging as launch_logging
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    OpaqueFunction,
+)
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.substitutions import FindPackageShare
 
@@ -61,14 +69,6 @@ def read_robot_id(config_path: str) -> str:
 
 
 def read_map_pcd(config_path: str) -> str:
-    """[map] pcd from the system INI as an absolute path — the map the localizer
-    loads at construction time. Empty string if not configured.
-
-    INI 裡寫的是相對 workspace root 的路徑（processes 以 workspace root 為 cwd 的
-    慣例），但這裡不用 cwd 解析：system.ini 就在 <workspace>/config/ 底下，直接
-    用 INI 自己的位置回推 workspace root。在 workspace root 啟動時兩者同值，而
-    launch 現在缺檔就整組不啟動——用 cwd 解析會讓「從別的目錄啟動」變成假的
-    缺檔失敗。"""
     config = configparser.ConfigParser()
     if not config.read(config_path):
         return ""
@@ -80,18 +80,6 @@ def read_map_pcd(config_path: str) -> str:
 
 
 def read_initial_pose(config_path: str):
-    """Read the [initial_pose] section from the INI — the robot's known start
-    pose in the map frame, same section syncai_amcl reads.
-
-    Returns a dict of localizer parameter overrides, or None when the section is
-    absent or malformed (the localizer then waits for a relocalize / initialpose
-    instead of auto-localizing at boot).
-
-    只送 x / y / yaw：localizer 的 z / roll / pitch 一律取自當下估計，INI 的 z
-    對它沒有意義（雷達斜裝 + map 重力對齊 → map_T_body 恆帶 mount pitch，
-    詳見 localizer_node.cpp 的 applyPlanarGuess）。AMCL 是平面 filter，
-    所以那邊連 z 一起送。
-    """
     config = configparser.ConfigParser()
     if not config.read(config_path) or not config.has_section("initial_pose"):
         logger.info(
@@ -121,32 +109,11 @@ def read_initial_pose(config_path: str):
     }
 
 
-def generate_pointlio_config(robot_id: str) -> str:
-    """Rewrite pointlio.yaml topics/frames with the robot_id prefix and
-    return the path of the generated file."""
+def pointlio_launch_file() -> str:
+    """pointlio's own launch file — the single definition of how pointlio_node is
+    configured (params file + topic remappings + robot_id frame overrides)."""
     pkg_pointlio = FindPackageShare("pointlio").find("pointlio")
-    src = os.path.join(pkg_pointlio, "config", "pointlio.yaml")
-    with open(src, "r") as f:
-        cfg = yaml.safe_load(f)
-    cfg["lidar_topic"] = f"/{robot_id}/livox/lidar"
-    cfg["imu_topic"] = f"/{robot_id}/livox/imu"
-    # Standalone frames — must stay in sync with pointlio_launch.py, which
-    # carries the full rationale. Short version: naming the body frame
-    # base_link gave that frame two TF parents (syncai_lio_bridge also
-    # broadcasts odom -> base_link), so which chain a lookup resolved through
-    # depended on the query time, and the backend's body_cloud silently went
-    # through lio_bridge's 2D-projected chain instead of the 6DOF LIO one.
-    cfg["world_frame"] = f"{robot_id}/pointlio_odom"
-    cfg["body_frame"] = f"{robot_id}/pointlio_body"
-
-    generated = tempfile.NamedTemporaryFile(
-        mode="w", prefix=f"pointlio_{robot_id}_", suffix=".yaml", delete=False
-    )
-
-    yaml.safe_dump(cfg, generated)
-    generated.close()
-    logger.info(f"generated pointlio config: {generated.name}")
-    return generated.name
+    return os.path.join(pkg_pointlio, "launch", "pointlio_launch.py")
 
 
 def localizer_params_file() -> str:
@@ -193,20 +160,22 @@ def launch_setup(context, *args, **kwargs):
         return []
 
     initial_pose = read_initial_pose(config_path)
-    pointlio_config = generate_pointlio_config(robot_id)
 
     return [
-        launch_ros.actions.Node(
-            package="pointlio",
-            namespace=f"{robot_id}/pointlio",
-            executable="pointlio_node",
-            name="pointlio_node",
-            output="screen",
-            parameters=[{"config_path": pointlio_config}],
+        # bag_topics is passed through explicitly rather than left to
+        # pointlio_launch.py's own default, so this launch's behaviour does not
+        # change under it: a real robot needs the /<robot_id>/livox/* topics the
+        # driver publishes.
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(pointlio_launch_file()),
+            launch_arguments={
+                "system_config": config_path,
+                "bag_topics": LaunchConfiguration("bag_topics"),
+            }.items(),
         ),
         launch_ros.actions.Node(
             package="localizer",
-            namespace=f"{robot_id}/localizer",
+            namespace=f"{robot_id}",
             executable="localizer_node",
             name="localizer_node",
             output="screen",
@@ -226,6 +195,16 @@ def generate_launch_description():
                 "system_config",
                 default_value=DEFAULT_SYSTEM_INI,
                 description="Path to the system INI file providing [system] robot_id",
+            ),
+            DeclareLaunchArgument(
+                "bag_topics",
+                default_value="false",
+                description=(
+                    "Forwarded to pointlio_launch.py: point its lidar/imu "
+                    "remappings at the raw /livox/{lidar,imu} topics instead of "
+                    "/<robot_id>/livox/{lidar,imu}, for replaying rosbags "
+                    "recorded without the robot_id prefix"
+                ),
             ),
             OpaqueFunction(function=launch_setup),
         ]
