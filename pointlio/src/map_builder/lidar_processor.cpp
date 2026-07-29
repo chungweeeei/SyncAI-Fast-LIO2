@@ -20,6 +20,8 @@ LidarProcessor::LidarProcessor(Config &config, std::shared_ptr<PointEKF> kf) : m
 
 void LidarProcessor::trimCloudMap()
 {
+    // 局部滑動地圖，確保 ikd-Tree 不會隨著機器人跑越遠而無限長大，這段邏輯是從 fastlio2 搬過來的
+    // 核心概念： 維持一個邊長 cube_len (300m) 的立方體，機器人快碰到邊界時，把立方體往前推。
     m_local_map.cub_to_rm.clear();
     const State &state = m_kf->x();
     Eigen::Vector3d pos_lidar = state.t_wi + state.r_wi * state.t_il;
@@ -34,6 +36,8 @@ void LidarProcessor::trimCloudMap()
         m_local_map.initialed = true;
         return;
     }
+    
+    // 檢查要不要把立方體往前推
     float dist_to_map_edge[3][2];
     bool need_move = false;
     double det_thresh = m_config.move_thresh * m_config.det_range;
@@ -47,6 +51,8 @@ void LidarProcessor::trimCloudMap()
     }
     if (!need_move)
         return;
+    
+    // 推立方體 + 標記要刪的區塊
     BoxPointType new_corner, temp_corner;
     new_corner = m_local_map.local_map_corner;
     float mov_dist = std::max((m_config.cube_len - 2.0 * m_config.move_thresh * m_config.det_range) * 0.5 * 0.9, double(m_config.det_range * (m_config.move_thresh - 1)));
@@ -84,6 +90,7 @@ void LidarProcessor::incrCloudMap()
 {
     if (m_cloud_down_lidar->empty())
         return;
+        
     // m_cloud_down_world 已在 processGroup / updateChunk 內用「各點群自己時間點
     // 的狀態」轉好 (point-by-point 等效去畸變)，這裡直接使用不再重算。
     int size = m_cloud_down_lidar->size();
@@ -139,6 +146,7 @@ void LidarProcessor::initCloudMap(PointVec &point_vec)
 
 void LidarProcessor::preprocess(SyncPackage &package, Vec<PointGroup> &groups)
 {
+    // VoxelGrid 降採樣的 voxel 大小套用在「 進入 EKF 之前」的該幀點雲上
     if (m_config.scan_resolution > 0.0)
     {
         m_scan_filter.setInputCloud(package.cloud);
@@ -154,6 +162,7 @@ void LidarProcessor::preprocess(SyncPackage &package, Vec<PointGroup> &groups)
               [](const PointType &p1, const PointType &p2)
               { return p1.curvature < p2.curvature; });
 
+    // 構成五個平行陣列 -> 全部都可以透過同一個 index
     int size = m_cloud_down_lidar->size();
     if (static_cast<int>(m_cloud_down_world->size()) < size)
     {

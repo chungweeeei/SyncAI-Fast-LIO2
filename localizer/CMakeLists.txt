@@ -26,7 +26,8 @@ find_package(pcl_conversions REQUIRED)
 
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
-find_package(yaml-cpp REQUIRED)
+# yaml-cpp is gone: the node reads standard ROS 2 parameters instead of parsing
+# its own YAML (it was also never declared in package.xml)
 
 
 
@@ -41,7 +42,7 @@ set(SRC_LIST src/localizers/commons.cpp
 
 add_executable(localizer_node src/localizer_node.cpp ${SRC_LIST})
 ament_target_dependencies(localizer_node rclcpp std_msgs sensor_msgs nav_msgs message_filters pcl_conversions tf2_ros geometry_msgs interface)
-target_link_libraries(localizer_node ${PCL_LIBRARIES}  yaml-cpp) 
+target_link_libraries(localizer_node ${PCL_LIBRARIES})
 
 
 install(TARGETS localizer_node DESTINATION lib/${PROJECT_NAME})

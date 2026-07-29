@@ -35,7 +35,6 @@ find_package(OpenMP QUIET)
 find_package(PCL REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(Sophus REQUIRED)
-find_package(yaml-cpp REQUIRED)
 
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
@@ -52,7 +51,6 @@ set(SRC_LIST src/map_builder/commons.cpp
 add_executable(pointlio_node src/pointlio_node.cpp ${SRC_LIST})
 ament_target_dependencies(pointlio_node rclcpp std_msgs tf2 tf2_ros nav_msgs sensor_msgs livox_ros_driver2 pcl_conversions geometry_msgs)
 target_link_libraries(pointlio_node
-  yaml-cpp
   ${PCL_LIBRARIES}
 )
 

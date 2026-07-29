@@ -8,7 +8,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <tf2_ros/transform_broadcaster.h>
-#include <yaml-cpp/yaml.h>
 
 #include <cmath>
 #include <filesystem>
@@ -28,13 +27,18 @@ struct NodeConfig
   std::string odom_topic = "/fastlio2/lio_odom";
   std::string map_frame = "map";
   std::string local_frame = "lidar";
-  // 相對名：繼承 node namespace（/<robot_id>/localizer/initialpose），
-  // 與 relocalize service 同一層
-  std::string initialpose_topic = "initialpose";
-  // system.ini 的 [map] pcd，由 launch 寫進產生的 yaml。initialpose 在地圖
+  // system.ini 的 [map] pcd，由 launch 以 parameter override 傳進來。initialpose 在地圖
   // 尚未載入時（localizer 重啟後還沒跑過 relocalize）用它自動 loadMap；
   // 空字串表示沒設定，此時 initialpose 只能在 relocalize 之後使用
   std::string map_path = "";
+  // system.ini 的 [initial_pose]：機器人開機時的已知起點（map frame）。設了以後
+  // 收到第一筆 odom 就自動套用一次當 ICP 的 initial guess，等同於自動跑一次
+  // relocalize，不必手動呼叫 service。
+  // 只有 x / y / yaw：z / roll / pitch 一律取自當下估計，理由見 applyPlanarGuess。
+  bool set_initial_pose = false;
+  double initial_pose_x = 0.0;
+  double initial_pose_y = 0.0;
+  double initial_pose_yaw = 0.0;
   double update_hz = 1.0;
 };
 
@@ -46,6 +50,9 @@ struct NodeState
   bool message_received = false;
   bool service_received = false;
   bool localize_success = false;
+  // config 的起點還沒套用。只有 timer 那條 thread 會碰它（建構期設定，spin
+  // 開始後只在 timerCB 讀寫），所以不需要鎖
+  bool initial_pose_pending = false;
   rclcpp::Time last_send_tf_time = rclcpp::Clock().now();
   builtin_interfaces::msg::Time last_message_time;
   CloudType::Ptr last_cloud = std::make_shared<CloudType>();
@@ -100,15 +107,14 @@ public:
       rmw_qos_profile_services_default, m_srv_cb_group);
 
     // RViz「2D Pose Estimate」等來源的 initial guess：走 relocalize 同一條
-    // initial_guess 路徑（下一輪 timerCB 拿去餵 ICP）。地圖已載入時不重載；
-    // 還沒載入（localizer 重啟後）則用 config 的 map_path 自動 loadMap。
-    // 因為可能 loadMap（耗時數秒），跟 services 放同一個 callback group，
+    // initial_guess 路徑（下一輪 timerCB 拿去餵 ICP）。地圖正常情況下已在建構
+    // 期載好（loadInitialMap），callback 裡只剩補救用的 loadMap 分支。
+    // 那個分支可能耗時數秒，所以跟 services 放同一個 callback group，
     // 才不會卡住 timer 那組的 TF 重播
     rclcpp::SubscriptionOptions initialpose_options;
     initialpose_options.callback_group = m_srv_cb_group;
     m_initialpose_sub = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
-      m_config.initialpose_topic, 10,
-      std::bind(&LocalizerNode::initialPoseCB, this, std::placeholders::_1),
+      "initialpose", 10, std::bind(&LocalizerNode::initialPoseCB, this, std::placeholders::_1),
       initialpose_options);
 
     // 地圖是靜態的：transient_local（latched）+ loadMap 成功後發一次，
@@ -116,48 +122,125 @@ public:
     m_map_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
       "map_cloud", rclcpp::QoS(1).transient_local());
 
+    // 地圖在建構期就載好。以前只有 relocalize 才 loadMap，重啟後先發
+    // initialpose 會撞上空 target（align() 直接 return false）；每個入口各自
+    // 補一次 loadMap 也讓「地圖是否已載入」變成隱性狀態。現在 launch 保證
+    // map_path 存在（缺檔就不啟動 node），這裡一次載完，relocalize /
+    // initialpose 只需要處理 guess。
+    // 必須放在 m_map_cloud_pub 之後（載完要 latched 發一次），而 spin 還沒
+    // 開始，同步載入數秒不會卡到任何 callback。
+    loadInitialMap();
+
+    // 起點只能延後到第一筆 odom 之後才套用（applyPlanarGuess 要拿當下估計補
+    // roll/pitch/z），所以建構期只立旗標，實際套用在 timerCB
+    m_state.initial_pose_pending = m_config.set_initial_pose;
+    if (m_config.set_initial_pose) {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "initial pose from config: x=%.3f y=%.3f yaw=%.3f (applied on first odom)",
+        m_config.initial_pose_x, m_config.initial_pose_y, m_config.initial_pose_yaw);
+    }
+
     m_timer = this->create_wall_timer(10ms, std::bind(&LocalizerNode::timerCB, this));
+  }
+
+  void loadInitialMap()
+  {
+    if (m_config.map_path.empty()) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "map_path is empty: starting with no map — localization stays idle until "
+        "the relocalize service loads one");
+      return;
+    }
+    if (!std::filesystem::exists(m_config.map_path)) {
+      RCLCPP_ERROR(
+        this->get_logger(), "map_path '%s' does not exist: starting with no map",
+        m_config.map_path.c_str());
+      return;
+    }
+    if (!m_localizer->loadMap(m_config.map_path)) {
+      RCLCPP_ERROR(
+        this->get_logger(), "failed to load map from '%s': starting with no map",
+        m_config.map_path.c_str());
+      return;
+    }
+    RCLCPP_INFO(this->get_logger(), "map preloaded from %s", m_config.map_path.c_str());
+    builtin_interfaces::msg::Time stamp = this->now();
+    publishMapCloud(stamp);
   }
 
   void loadParameters()
   {
-    this->declare_parameter("config_path", "");
-    std::string config_path;
-    this->get_parameter<std::string>("config_path", config_path);
-    YAML::Node config = YAML::LoadFile(config_path);
-    if (!config) {
-      RCLCPP_WARN(this->get_logger(), "FAIL TO LOAD YAML FILE!");
-      return;
-    }
-    RCLCPP_INFO(this->get_logger(), "LOAD FROM YAML CONFIG PATH: %s", config_path.c_str());
+    // 走標準 ROS 2 parameters（config/localizer.yaml 是 /**/localizer_node 的
+    // params 檔，launch 再疊上 robot_id 前綴的 topic / map_path 覆寫）。
+    // 舊版是自己用 yaml-cpp 讀 config_path 指到的扁平 YAML：ros2 param 只看得到
+    // config_path、不能用 --params-file，而且 config_path 沒帶時 YAML::LoadFile
+    // 會丟例外、必填 key 少一個就 InvalidNode，node 直接在建構期掛掉。
+    // 現在每個參數都以 struct 的預設值當 default，缺項只是沿用預設。
+    m_config.cloud_topic = declare_parameter<std::string>("cloud_topic", m_config.cloud_topic);
+    m_config.odom_topic = declare_parameter<std::string>("odom_topic", m_config.odom_topic);
+    m_config.map_frame = declare_parameter<std::string>("map_frame", m_config.map_frame);
+    m_config.local_frame = declare_parameter<std::string>("local_frame", m_config.local_frame);
+    m_config.map_path = declare_parameter<std::string>("map_path", m_config.map_path);
+    m_config.update_hz = declare_parameter<double>("update_hz", m_config.update_hz);
 
-    m_config.cloud_topic = config["cloud_topic"].as<std::string>();
-    m_config.odom_topic = config["odom_topic"].as<std::string>();
-    m_config.map_frame = config["map_frame"].as<std::string>();
-    m_config.local_frame = config["local_frame"].as<std::string>();
-    // 選填：沒設就用相對名 initialpose（吃 node namespace）
-    if (config["initialpose_topic"])
-      m_config.initialpose_topic = config["initialpose_topic"].as<std::string>();
-    // 選填：沒設就維持空字串（initialpose 不會自動載地圖）
-    if (config["map_path"]) m_config.map_path = config["map_path"].as<std::string>();
-    m_config.update_hz = config["update_hz"].as<double>();
+    // 巢狀名稱（initial_pose.x）跟 syncai_amcl 的 set_initial_pose /
+    // initial_pose.* 對齊，兩邊都是由 launch 從 system.ini 的 [initial_pose]
+    // 覆寫。這裡刻意不收 z：見 applyPlanarGuess
+    m_config.set_initial_pose =
+      declare_parameter<bool>("set_initial_pose", m_config.set_initial_pose);
+    m_config.initial_pose_x = declare_parameter<double>("initial_pose.x", m_config.initial_pose_x);
+    m_config.initial_pose_y = declare_parameter<double>("initial_pose.y", m_config.initial_pose_y);
+    m_config.initial_pose_yaw =
+      declare_parameter<double>("initial_pose.yaw", m_config.initial_pose_yaw);
 
-    m_localizer_config.rough_scan_resolution = config["rough_scan_resolution"].as<double>();
-    m_localizer_config.rough_map_resolution = config["rough_map_resolution"].as<double>();
-    m_localizer_config.rough_max_iteration = config["rough_max_iteration"].as<int>();
-    m_localizer_config.rough_score_thresh = config["rough_score_thresh"].as<double>();
-    m_localizer_config.rough_max_corr_dist = config["rough_max_corr_dist"].as<double>();
+    m_localizer_config.rough_scan_resolution =
+      declare_parameter<double>("rough_scan_resolution", m_localizer_config.rough_scan_resolution);
+    m_localizer_config.rough_map_resolution =
+      declare_parameter<double>("rough_map_resolution", m_localizer_config.rough_map_resolution);
+    m_localizer_config.rough_max_iteration =
+      declare_parameter<int>("rough_max_iteration", m_localizer_config.rough_max_iteration);
+    m_localizer_config.rough_score_thresh =
+      declare_parameter<double>("rough_score_thresh", m_localizer_config.rough_score_thresh);
+    m_localizer_config.rough_max_corr_dist =
+      declare_parameter<double>("rough_max_corr_dist", m_localizer_config.rough_max_corr_dist);
 
-    m_localizer_config.refine_scan_resolution = config["refine_scan_resolution"].as<double>();
-    m_localizer_config.refine_map_resolution = config["refine_map_resolution"].as<double>();
-    m_localizer_config.refine_max_iteration = config["refine_max_iteration"].as<int>();
-    m_localizer_config.refine_score_thresh = config["refine_score_thresh"].as<double>();
-    m_localizer_config.refine_max_corr_dist = config["refine_max_corr_dist"].as<double>();
+    m_localizer_config.refine_scan_resolution = declare_parameter<double>(
+      "refine_scan_resolution", m_localizer_config.refine_scan_resolution);
+    m_localizer_config.refine_map_resolution =
+      declare_parameter<double>("refine_map_resolution", m_localizer_config.refine_map_resolution);
+    m_localizer_config.refine_max_iteration =
+      declare_parameter<int>("refine_max_iteration", m_localizer_config.refine_max_iteration);
+    m_localizer_config.refine_score_thresh =
+      declare_parameter<double>("refine_score_thresh", m_localizer_config.refine_score_thresh);
+    m_localizer_config.refine_max_corr_dist =
+      declare_parameter<double>("refine_max_corr_dist", m_localizer_config.refine_max_corr_dist);
+
+    RCLCPP_INFO(
+      this->get_logger(), "params: cloud_topic=%s odom_topic=%s map_frame=%s update_hz=%.2f",
+      m_config.cloud_topic.c_str(), m_config.odom_topic.c_str(), m_config.map_frame.c_str(),
+      m_config.update_hz);
   }
 
   void timerCB()
   {
     if (!m_state.message_received) return;
+
+    // config 的已知起點：第一筆 odom 到了才有「當下估計」可以補 roll/pitch/z，
+    // 所以在這裡套用而不是建構期。只有一次機會——旗標先清掉，就算地圖沒載入
+    // 而跳過，也不會留到之後某次 relocalize 載完圖才突然蓋掉那次的 guess。
+    if (m_state.initial_pose_pending) {
+      m_state.initial_pose_pending = false;
+      if (m_localizer->isMapLoaded()) {
+        applyPlanarGuess(
+          m_config.initial_pose_x, m_config.initial_pose_y, m_config.initial_pose_yaw, "config");
+      } else {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "initial pose from config skipped: no map loaded — use the relocalize service");
+      }
+    }
 
     rclcpp::Duration diff = rclcpp::Clock().now() - m_state.last_send_tf_time;
 
@@ -309,10 +392,10 @@ public:
 
   void initialPoseCB(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
   {
-    // 地圖沒載入時 align() 在空 target 上直接 return false（連 guess 都不會
-    // log），initialpose 看起來就像完全沒反應——實機上 localizer 重啟後先拉
-    // initialpose 就是這樣中招的。所以這裡補上 relocalize 的另一半：用
-    // system.ini 帶進來的 map_path 自動載圖；沒設定就明確警告並忽略，
+    // 正常路徑上地圖已經在建構期載好（loadInitialMap），這段只在 map_path 沒設
+    // 或當時載入失敗時才會走到。保留它是因為地圖沒載入時 align() 會在空 target
+    // 上直接 return false（連 guess 都不會 log），initialpose 看起來就像完全沒
+    // 反應——實機上就是這樣中招過。這裡要嘛補載成功、要嘛明確警告並忽略，
     // 不留下一個等地圖載入後才生效的過期 guess。
     if (!m_localizer->isMapLoaded()) {
       if (m_config.map_path.empty() || !std::filesystem::exists(m_config.map_path)) {
@@ -346,29 +429,38 @@ public:
       msg->pose.pose.orientation.w, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y,
       msg->pose.pose.orientation.z);
     q.normalize();
+    M3D msg_r = q.toRotationMatrix();
+    applyPlanarGuess(
+      msg->pose.pose.position.x, msg->pose.pose.position.y,
+      std::atan2(msg_r(1, 0), msg_r(0, 0)), "initialpose");
+  }
 
-    // 2D 來源（RViz 2D Pose Estimate、前端 gridmap）只給得出 x, y, yaw
-    // （z=0、roll=pitch=0）。但雷達斜裝 + map 重力對齊時，map_T_body 恆帶
-    // ~15° 的 mount pitch：直接拿 msg 姿態當 guess 會讓 scan 相對地圖整體
-    // 傾斜，遠處點的誤差超過 rough_max_corr_dist，rough ICP 永遠過不了
-    // score 門檻——而 pending 期間 timerCB 又跳過 odom 回饋路徑，定位就
-    // 凍在舊 offset 上無限重試（實機在 (5.0, 0.982) 發 initialpose 卡死，
-    // 補上 14.6° pitch 後同一位置第一輪就收斂）。
-    // 所以只取 msg 的 x, y, yaw；roll/pitch/z 從目前估計補齊。
-    M3D guess_r = q.toRotationMatrix();
-    V3D guess_t(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
+  // 把 2D 起點（x, y, yaw）組成 ICP 的 initial guess。兩個來源共用：RViz /
+  // 前端 gridmap 的 initialpose，以及 system.ini [initial_pose] 的開機起點。
+  //
+  // 2D 來源只給得出 x, y, yaw（z=0、roll=pitch=0）。但雷達斜裝 + map 重力對齊
+  // 時，map_T_body 恆帶 ~15° 的 mount pitch：直接拿 2D 姿態當 guess 會讓 scan
+  // 相對地圖整體傾斜，遠處點的誤差超過 rough_max_corr_dist，rough ICP 永遠過不
+  // 了 score 門檻——而 pending 期間 timerCB 又跳過 odom 回饋路徑，定位就凍在舊
+  // offset 上無限重試（實機在 (5.0, 0.982) 發 initialpose 卡死，補上 14.6°
+  // pitch 後同一位置第一輪就收斂）。
+  // 所以只取 x, y, yaw；roll/pitch/z 一律從目前估計補齊。
+  void applyPlanarGuess(double x, double y, double yaw, const char * source)
+  {
+    M3D guess_r = Eigen::AngleAxisd(yaw, V3D::UnitZ()).toRotationMatrix();
+    V3D guess_t(x, y, 0.0);
     {
       std::lock_guard<std::mutex> lock(m_state.message_mutex);
       if (m_state.message_received) {
         M3D cur_r = m_state.last_offset_r * m_state.last_r;
         V3D cur_t = m_state.last_offset_r * m_state.last_t + m_state.last_offset_t;
-        double msg_yaw = std::atan2(guess_r(1, 0), guess_r(0, 0));
         double cur_yaw = std::atan2(cur_r(1, 0), cur_r(0, 0));
-        // 保留目前姿態的重力傾角，只把 heading 轉到 msg 的 yaw
-        guess_r = Eigen::AngleAxisd(msg_yaw - cur_yaw, V3D::UnitZ()).toRotationMatrix() * cur_r;
+        // 保留目前姿態的重力傾角，只把 heading 轉到指定的 yaw
+        guess_r = Eigen::AngleAxisd(yaw - cur_yaw, V3D::UnitZ()).toRotationMatrix() * cur_r;
         guess_t.z() = cur_t.z();
       }
-      // 開機初期還沒收到任何 odom 時沒有估計可補，msg 原樣用
+      // 開機初期還沒收到任何 odom 時沒有估計可補，就用純 2D 的姿態
+      // （config 的起點是等到第一筆 odom 才套用，不會走到這裡）
     }
 
     std::lock_guard<std::mutex> lock(m_state.service_mutex);
@@ -378,8 +470,9 @@ public:
     m_state.service_received = true;
     m_state.localize_success = false;
     RCLCPP_INFO(
-      this->get_logger(), "initialpose received: x=%.3f y=%.3f z=%.3f (yaw from msg, roll/pitch/z from current estimate)",
-      guess_t.x(), guess_t.y(), guess_t.z());
+      this->get_logger(),
+      "guess from %s applied: x=%.3f y=%.3f z=%.3f yaw=%.3f (roll/pitch/z from current estimate)",
+      source, guess_t.x(), guess_t.y(), guess_t.z(), yaw);
   }
 
   void relocCheckCB(
@@ -424,6 +517,7 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr m_initialpose_sub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_map_cloud_pub;
 };
+
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);

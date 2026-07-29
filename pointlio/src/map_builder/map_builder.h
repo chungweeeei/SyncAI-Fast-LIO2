@@ -4,9 +4,9 @@
 
 enum BuilderStatus
 {
-    IMU_INIT,
-    MAP_INIT,
-    MAPPING
+    IMU_INIT,       // 累積夠 IMU
+    MAP_INIT,       // 建立完初始地圖
+    MAPPING         
 };
 
 class MapBuilder

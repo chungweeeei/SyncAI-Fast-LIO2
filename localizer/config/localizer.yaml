@@ -1,25 +1,58 @@
-cloud_topic: /pointlio/body_cloud
-odom_topic: /pointlio/lio_odom
-map_frame: map
-local_frame: laser
-# initial guess 來源（RViz 2D Pose Estimate 等）。相對名會繼承 node namespace，
-# 實際 topic 為 /<robot_id>/localizer/initialpose
-initialpose_topic: initialpose
-# map_path（選填）：initialpose 在地圖尚未載入時自動 loadMap 用的 PCD。
-# 這裡不設值——launch 會從 system.ini 的 [map] pcd 注入絕對路徑；
-# 沒設定時 initialpose 需要先跑過一次 relocalize 才有效
-update_hz: 1.0
+# Parameters for the localizer "localizer_node".
+#
+# 標準 ROS 2 params 檔。原本是 node 自己用 yaml-cpp 讀的扁平 YAML，只有
+# config_path 是真正的 parameter，其餘在 `ros2 param` 完全看不到；改成這個格式
+# 後可以 `ros2 param get/dump`，也能用
+#   ros2 run localizer localizer_node --ros-args --params-file <此檔>
+# 單獨啟動。
+#
+# /**/ wildcard key 讓同一份檔在任何 namespace 都適用：launch 讀
+# config/system.ini 的 robot_id 當 namespace，實際 FQN 是
+# /<robot_id>/localizer/localizer_node。
+#
+# cloud_topic / odom_topic 指向 pointlio 的輸出（在 /<robot_id>/pointlio/ 底下），
+# 不在 localizer 自己的 namespace 裡，相對名接不上——所以 launch 會用 robot_id
+# 前綴覆寫這兩個值。這裡的值只是不透過 launch 直接 ros2 run 時的 fallback。
+/**/localizer_node:
+  ros__parameters:
+    cloud_topic: /pointlio/body_cloud
+    odom_topic: /pointlio/lio_odom
 
-rough_scan_resolution: 0.25
-rough_map_resolution: 0.25
-rough_max_iteration: 5
-rough_score_thresh: 0.2
-# correspondence 配對距離上限（m）：rough 給大一點吸收 relocalize 手動 guess 的誤差
-rough_max_corr_dist: 2.0
+    # TF frame 名不會被 ROS namespace 前綴，值就是實際 frame 名。local_frame
+    # 只是 fallback：收到第一筆 odom 後 node 會改用該訊息的 header.frame_id
+    map_frame: map
+    local_frame: laser
 
-refine_scan_resolution: 0.1
-refine_map_resolution: 0.1
-refine_max_iteration: 10
-refine_score_thresh: 0.1
-# refine 收緊，只用近距離配對做精配
-refine_max_corr_dist: 0.5
+    # map_path：node 在建構期就 loadMap 的 PCD。這裡留空——launch 會從
+    # system.ini 的 [map] pcd 覆寫成絕對路徑，缺檔就整組不啟動。留空時
+    # node 仍會起來，但要等 relocalize service 帶地圖進來才能定位
+    map_path: ""
+
+    # 開機時的已知起點（map frame）。true 時收到第一筆 odom 就自動套用一次當
+    # ICP 的 initial guess，等同自動跑一次 relocalize——不必手動呼叫 service。
+    # launch 會用 system.ini 的 [initial_pose] 覆寫（該區段存在才會設 true），
+    # 命名對齊 syncai_amcl 的 set_initial_pose / initial_pose.*。
+    # 只有 x / y / yaw：z / roll / pitch 取自當下估計，因為雷達斜裝 + map 重力
+    # 對齊時 map_T_body 恆帶 mount pitch，用 pitch=0 的 2D 姿態會讓 ICP 對不上
+    # （詳見 localizer_node.cpp 的 applyPlanarGuess）
+    set_initial_pose: false
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      yaw: 0.0
+
+    update_hz: 1.0
+
+    rough_scan_resolution: 0.25
+    rough_map_resolution: 0.25
+    rough_max_iteration: 5
+    rough_score_thresh: 0.2
+    # correspondence 配對距離上限（m）：rough 給大一點吸收 relocalize 手動 guess 的誤差
+    rough_max_corr_dist: 2.0
+
+    refine_scan_resolution: 0.1
+    refine_map_resolution: 0.1
+    refine_max_iteration: 10
+    refine_score_thresh: 0.1
+    # refine 收緊，只用近距離配對做精配
+    refine_max_corr_dist: 0.5

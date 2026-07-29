@@ -13,7 +13,6 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
-#include <yaml-cpp/yaml.h>
 
 #include "map_builder/commons.h"
 #include "map_builder/map_builder.h"
@@ -21,10 +20,14 @@
 #include "utils.h"
 
 using namespace std::chrono_literals;
+// Input topics are NOT parameters: the node subscribes to the relative names
+// "lidar" and "imu" and the launch file remaps them onto the driver's
+// /<robot_id>/livox/{lidar,imu} (a relative name alone cannot reach them —
+// the node runs in the /<robot_id>/pointlio namespace, so "lidar" would resolve
+// to /<robot_id>/pointlio/lidar). Remapping is the ROS-native knob for this and
+// keeps `ros2 node info` honest about where the data comes from.
 struct NodeConfig
 {
-  std::string imu_topic = "/livox/imu";
-  std::string lidar_topic = "/livox/lidar";
   std::string body_frame = "body";
   std::string world_frame = "lidar";
   bool print_time_cost = false;
@@ -62,24 +65,26 @@ public:
 
     // register imu subscriber
     m_imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(
-      m_node_config.imu_topic, 10, std::bind(&PointLIONode::imuCB, this, std::placeholders::_1));
+      "imu", 10, std::bind(&PointLIONode::imuCB, this, std::placeholders::_1));
 
-    // register scan subscriber
+    // register scan subscriber. Log the resolved name so a missing/incorrect
+    // remapping is visible at startup instead of showing up as "no data".
     if (m_node_config.lidar_type == 1) {
+      m_pc2_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+        "lidar", 10, std::bind(&PointLIONode::pc2CB, this, std::placeholders::_1));
       RCLCPP_INFO(
         this->get_logger(), "[PointLIONode][%s] Lidar input: sensor_msgs/PointCloud2 (%s)",
-        __func__, m_node_config.lidar_topic.c_str());
-      m_pc2_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-        m_node_config.lidar_topic, 10,
-        std::bind(&PointLIONode::pc2CB, this, std::placeholders::_1));
+        __func__, m_pc2_sub->get_topic_name());
     } else {
-      RCLCPP_INFO(
-        this->get_logger(), "Lidar input: livox_ros_driver2/CustomMsg (%s)",
-        m_node_config.lidar_topic.c_str());
       m_lidar_sub = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
-        m_node_config.lidar_topic, 10,
-        std::bind(&PointLIONode::lidarCB, this, std::placeholders::_1));
+        "lidar", 10, std::bind(&PointLIONode::lidarCB, this, std::placeholders::_1));
+      RCLCPP_INFO(
+        this->get_logger(), "[PointLIONode][%s] Lidar input: livox_ros_driver2/CustomMsg (%s)",
+        __func__, m_lidar_sub->get_topic_name());
     }
+    RCLCPP_INFO(
+      this->get_logger(), "[PointLIONode][%s] IMU input: %s", __func__,
+      m_imu_sub->get_topic_name());
 
     // register publisher
     m_body_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("body_cloud", 10000);
@@ -102,67 +107,103 @@ public:
     m_timer = this->create_wall_timer(20ms, std::bind(&PointLIONode::timerCB, this));
   }
 
+  // Everything is a declared ROS parameter, fed by config/pointlio.yaml through
+  // the launch file's `parameters=[...]`. The node used to take a single
+  // `config_path` parameter and parse that YAML itself with yaml-cpp, which put
+  // it outside every ROS tool: `ros2 param list/get/dump` showed only
+  // config_path, a launch-level override could not touch a single value, and
+  // the launch file had to rewrite the whole YAML into a /tmp file just to
+  // inject the robot_id prefix. Declaring them properly is what lets the launch
+  // layer the two robot_id-dependent frame names on top of the shared file.
+  //
+  // The defaults below deliberately repeat the struct defaults (NodeConfig here,
+  // Config in map_builder/commons.h) so a missing key degrades exactly the way
+  // running the node without any params file does, instead of throwing.
   void loadParameters()
   {
-    this->declare_parameter("config_path", "");
-    std::string config_path;
-    this->get_parameter<std::string>("config_path", config_path);
-
-    YAML::Node config = YAML::LoadFile(config_path);
-    if (!config) {
-      RCLCPP_WARN(this->get_logger(), "[PointLIONode][%s] FAIL TO LOAD YAML FILE!", __func__);
-      return;
-    }
-
-    RCLCPP_INFO(
-      this->get_logger(), "[PointLIONode][%s] LOAD FROM YAML CONFIG PATH: %s", __func__,
-      config_path.c_str());
-
-    // config for pointlio node
-    m_node_config.imu_topic = config["imu_topic"].as<std::string>();
-    m_node_config.lidar_topic = config["lidar_topic"].as<std::string>();
-    m_node_config.body_frame = config["body_frame"].as<std::string>();
-    m_node_config.world_frame = config["world_frame"].as<std::string>();
-    m_node_config.print_time_cost = config["print_time_cost"].as<bool>();
-    if (config["lidar_type"]) m_node_config.lidar_type = config["lidar_type"].as<int>();
-    if (config["imu_acc_scale"]) m_node_config.imu_acc_scale = config["imu_acc_scale"].as<double>();
+    // Frame names. TF frame ids are NOT namespaced by ROS, so the launch file
+    // overrides both with the <robot_id>/ prefix; these are only the fallbacks
+    // for running pointlio_node bare.
+    m_node_config.body_frame = this->declare_parameter("body_frame", m_node_config.body_frame);
+    m_node_config.world_frame = this->declare_parameter("world_frame", m_node_config.world_frame);
+    m_node_config.print_time_cost =
+      this->declare_parameter("print_time_cost", m_node_config.print_time_cost);
+    m_node_config.lidar_type = this->declare_parameter("lidar_type", m_node_config.lidar_type);
+    m_node_config.imu_acc_scale =
+      this->declare_parameter("imu_acc_scale", m_node_config.imu_acc_scale);
 
     // config for map builder
-    m_builder_config.lidar_filter_num = config["lidar_filter_num"].as<int>();
-    m_builder_config.lidar_min_range = config["lidar_min_range"].as<double>();
-    m_builder_config.lidar_max_range = config["lidar_max_range"].as<double>();
-    m_builder_config.scan_resolution = config["scan_resolution"].as<double>();
-    m_builder_config.map_resolution = config["map_resolution"].as<double>();
-    m_builder_config.cube_len = config["cube_len"].as<double>();
-    m_builder_config.det_range = config["det_range"].as<double>();
-    m_builder_config.move_thresh = config["move_thresh"].as<double>();
+    m_builder_config.lidar_filter_num =
+      this->declare_parameter("lidar_filter_num", m_builder_config.lidar_filter_num);
+    m_builder_config.lidar_min_range =
+      this->declare_parameter("lidar_min_range", m_builder_config.lidar_min_range);
+    m_builder_config.lidar_max_range =
+      this->declare_parameter("lidar_max_range", m_builder_config.lidar_max_range);
+    m_builder_config.scan_resolution =
+      this->declare_parameter("scan_resolution", m_builder_config.scan_resolution);
+    m_builder_config.map_resolution =
+      this->declare_parameter("map_resolution", m_builder_config.map_resolution);
+    m_builder_config.cube_len = this->declare_parameter("cube_len", m_builder_config.cube_len);
+    m_builder_config.det_range = this->declare_parameter("det_range", m_builder_config.det_range);
+    m_builder_config.move_thresh =
+      this->declare_parameter("move_thresh", m_builder_config.move_thresh);
 
     // Point-LIO output model
-    m_builder_config.gyr_cov_output = config["gyr_cov_output"].as<double>();
-    m_builder_config.acc_cov_output = config["acc_cov_output"].as<double>();
-    m_builder_config.b_gyr_cov = config["b_gyr_cov"].as<double>();
-    m_builder_config.b_acc_cov = config["b_acc_cov"].as<double>();
-    m_builder_config.imu_meas_omg_cov = config["imu_meas_omg_cov"].as<double>();
-    m_builder_config.imu_meas_acc_cov = config["imu_meas_acc_cov"].as<double>();
-    m_builder_config.satu_gyro = config["satu_gyro"].as<double>();
-    m_builder_config.satu_acc = config["satu_acc"].as<double>();
-    m_builder_config.lidar_meas_cov = config["lidar_meas_cov"].as<double>();
-    m_builder_config.plane_thr = config["plane_thr"].as<double>();
-    m_builder_config.batch_max_points = config["batch_max_points"].as<int>();
+    m_builder_config.gyr_cov_output =
+      this->declare_parameter("gyr_cov_output", m_builder_config.gyr_cov_output);
+    m_builder_config.acc_cov_output =
+      this->declare_parameter("acc_cov_output", m_builder_config.acc_cov_output);
+    m_builder_config.b_gyr_cov = this->declare_parameter("b_gyr_cov", m_builder_config.b_gyr_cov);
+    m_builder_config.b_acc_cov = this->declare_parameter("b_acc_cov", m_builder_config.b_acc_cov);
+    m_builder_config.imu_meas_omg_cov =
+      this->declare_parameter("imu_meas_omg_cov", m_builder_config.imu_meas_omg_cov);
+    m_builder_config.imu_meas_acc_cov =
+      this->declare_parameter("imu_meas_acc_cov", m_builder_config.imu_meas_acc_cov);
+    m_builder_config.satu_gyro = this->declare_parameter("satu_gyro", m_builder_config.satu_gyro);
+    m_builder_config.satu_acc = this->declare_parameter("satu_acc", m_builder_config.satu_acc);
+    m_builder_config.lidar_meas_cov =
+      this->declare_parameter("lidar_meas_cov", m_builder_config.lidar_meas_cov);
+    m_builder_config.plane_thr = this->declare_parameter("plane_thr", m_builder_config.plane_thr);
+    m_builder_config.batch_max_points =
+      this->declare_parameter("batch_max_points", m_builder_config.batch_max_points);
 
-    m_builder_config.imu_init_num = config["imu_init_num"].as<int>();
-    m_builder_config.near_search_num = config["near_search_num"].as<int>();
-    m_builder_config.gravity_align = config["gravity_align"].as<bool>();
-    m_builder_config.esti_il = config["esti_il"].as<bool>();
-    std::vector<double> t_il_vec = config["t_il"].as<std::vector<double>>();
-    std::vector<double> r_il_vec = config["r_il"].as<std::vector<double>>();
-    m_builder_config.t_il << t_il_vec[0], t_il_vec[1], t_il_vec[2];
-    m_builder_config.r_il << r_il_vec[0], r_il_vec[1], r_il_vec[2], r_il_vec[3], r_il_vec[4],
-      r_il_vec[5], r_il_vec[6], r_il_vec[7], r_il_vec[8];
+    m_builder_config.imu_init_num =
+      this->declare_parameter("imu_init_num", m_builder_config.imu_init_num);
+    m_builder_config.near_search_num =
+      this->declare_parameter("near_search_num", m_builder_config.near_search_num);
+    m_builder_config.gravity_align =
+      this->declare_parameter("gravity_align", m_builder_config.gravity_align);
+    m_builder_config.esti_il = this->declare_parameter("esti_il", m_builder_config.esti_il);
+
+    // IMU <- lidar extrinsic. Flat double arrays because ROS parameters have no
+    // nested/matrix type; the size checks matter because the old yaml-cpp path
+    // indexed r_il_vec[8] with no validation, i.e. a short list in the config
+    // was undefined behaviour rather than an error message.
+    std::vector<double> t_il_vec = this->declare_parameter<std::vector<double>>(
+      "t_il", {m_builder_config.t_il.x(), m_builder_config.t_il.y(), m_builder_config.t_il.z()});
+    std::vector<double> r_il_vec = this->declare_parameter<std::vector<double>>(
+      "r_il", {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0});
+    if (t_il_vec.size() == 3) {
+      m_builder_config.t_il << t_il_vec[0], t_il_vec[1], t_il_vec[2];
+    } else {
+      RCLCPP_ERROR(
+        this->get_logger(), "[PointLIONode][%s] t_il needs 3 elements, got %zu; keeping default",
+        __func__, t_il_vec.size());
+    }
+    if (r_il_vec.size() == 9) {
+      m_builder_config.r_il << r_il_vec[0], r_il_vec[1], r_il_vec[2], r_il_vec[3], r_il_vec[4],
+        r_il_vec[5], r_il_vec[6], r_il_vec[7], r_il_vec[8];
+    } else {
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "[PointLIONode][%s] r_il needs 9 elements (row-major 3x3), got %zu; keeping identity",
+        __func__, r_il_vec.size());
+    }
   }
 
   void imuCB(const sensor_msgs::msg::Imu::SharedPtr msg)
   {
+    // only use to store imu data into data structure
     std::lock_guard<std::mutex> lock(m_state_data.imu_mutex);
     double timestamp = Utils::getSec(msg->header);
     if (timestamp < m_state_data.last_imu_time) {
@@ -177,8 +218,10 @@ public:
       V3D(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z), timestamp);
     m_state_data.last_imu_time = timestamp;
   }
+
   void lidarCB(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg)
   {
+    // only use to store lidar data into data structure
     CloudType::Ptr cloud = Utils::livox2PCL(
       msg, m_builder_config.lidar_filter_num, m_builder_config.lidar_min_range,
       m_builder_config.lidar_max_range);
@@ -225,10 +268,12 @@ public:
     // 一幀 lidar 並不是一收到就處理，必須等到 IMU 「補齊」到掃描結束時刻才行。
     if (!m_state_data.lidar_pushed) {
       m_package.cloud = m_state_data.lidar_buffer.front().second;
-      // sorted
+
+      // pointcloud 中的 curvature 欄位被用來存放每一點的時間搓, 排序目的就是讓 pointcloud 最後一個點是最晚的點否則就只是點雲陣列的最後一個元素與時間無關
       std::sort(
         m_package.cloud->points.begin(), m_package.cloud->points.end(),
         [](PointType & p1, PointType & p2) { return p1.curvature < p2.curvature; });
+
       m_package.cloud_start_time = m_state_data.lidar_buffer.front().first;
       m_package.cloud_end_time =
         m_package.cloud_start_time + m_package.cloud->points.back().curvature / 1000.0;
@@ -241,9 +286,9 @@ public:
 
     // 清空 + 釋放 m_package 中的 imu 資料
     Vec<IMUData>().swap(m_package.imus);
-    // 將該幀需要用的 IMU 資料撈出來並把 imu_buffer 跟 lidar_buffer 清乾淨
-    while (!m_state_data.imu_buffer.empty() &&
-           m_state_data.imu_buffer.front().time < m_package.cloud_end_time) {
+
+    // 將該幀需要用的 IMU 資料撈出來並把 imu_buffer 清乾淨
+    while (!m_state_data.imu_buffer.empty() && m_state_data.imu_buffer.front().time < m_package.cloud_end_time) {
       // 把需要用到的 imu 資料塞回 m_package.
       m_package.imus.emplace_back(m_state_data.imu_buffer.front());
       m_state_data.imu_buffer.pop_front();
@@ -289,6 +334,7 @@ public:
     odom.twist.twist.linear.x = vel.x();
     odom.twist.twist.linear.y = vel.y();
     odom.twist.twist.linear.z = vel.z();
+
     // output model 直接估測角速度, 一併輸出
     odom.twist.twist.angular.x = m_kf->x().omg.x();
     odom.twist.twist.angular.y = m_kf->x().omg.y();
@@ -324,8 +370,12 @@ public:
     transformStamped.header.frame_id = frame_id;
     transformStamped.child_frame_id = child_frame;
     transformStamped.header.stamp = Utils::getTime(time);
+
+    // 下標 wi 讀作 w ← i，右到左：「從 i 到 w」。跟 r_il 是 i ← l（lidar → IMU）
+    // 完整的鏈：lidar 系 ──T_il──> IMU 系 ──T_wi──> 世界系
     Eigen::Quaterniond q(m_kf->x().r_wi);
     V3D t = m_kf->x().t_wi;
+
     transformStamped.transform.translation.x = t.x();
     transformStamped.transform.translation.y = t.y();
     transformStamped.transform.translation.z = t.z();
@@ -352,6 +402,8 @@ public:
 
     if (m_builder->status() != BuilderStatus::MAPPING) return;
 
+    // world frame -> odom3D
+    // body_frame -> laser3D
     broadCastTF(
       m_tf_broadcaster, m_node_config.world_frame, m_node_config.body_frame,
       m_package.cloud_end_time);
@@ -361,17 +413,16 @@ public:
 
     CloudType::Ptr body_cloud =
       m_builder->lidar_processor()->transformCloud(m_package.cloud, m_kf->x().r_il, m_kf->x().t_il);
-
     publishCloud(m_body_cloud_pub, body_cloud, m_node_config.body_frame, m_package.cloud_end_time);
 
     // 注意: world_cloud 是整幀用「掃描結束時刻」的 pose 轉換的, 僅供顯示;
     // 進地圖的點是 point-by-point 在各自時間點轉換的 (lidar_processor)。
     CloudType::Ptr world_cloud = m_builder->lidar_processor()->transformCloud(
       m_package.cloud, m_builder->lidar_processor()->r_wl(), m_builder->lidar_processor()->t_wl());
-
     publishCloud(
       m_world_cloud_pub, world_cloud, m_node_config.world_frame, m_package.cloud_end_time);
 
+    // odom path
     publishPath(m_path_pub, m_node_config.world_frame, m_package.cloud_end_time);
   }
 
