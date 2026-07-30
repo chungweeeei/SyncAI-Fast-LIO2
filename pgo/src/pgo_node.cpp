@@ -49,8 +49,13 @@ public:
     rclcpp::QoS qos = rclcpp::QoS(10);
     m_cloud_sub.subscribe(this, m_node_config.cloud_topic, qos.get_rmw_qos_profile());
     m_odom_sub.subscribe(this, m_node_config.odom_topic, qos.get_rmw_qos_profile());
+    // Relative name, was the absolute "/pgo/loop_markers": the launch runs this
+    // node at /<robot_id>/pgo, and an absolute name ignores that namespace, so
+    // two robots in one DDS domain would publish onto the same topic. The
+    // inputs above stay absolute on purpose — they live in pointlio's
+    // namespace, which a relative name cannot reach.
     m_loop_marker_pub =
-      this->create_publisher<visualization_msgs::msg::MarkerArray>("/pgo/loop_markers", 10000);
+      this->create_publisher<visualization_msgs::msg::MarkerArray>("loop_markers", 10000);
     m_tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
     m_sync = std::make_shared<
       message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<
@@ -62,8 +67,10 @@ public:
     m_sync->registerCallback(
       std::bind(&PGONode::syncCB, this, std::placeholders::_1, std::placeholders::_2));
     m_timer = this->create_wall_timer(50ms, std::bind(&PGONode::timerCB, this));
+    // Relative for the same reason as loop_markers — the service is now
+    // /<robot_id>/pgo/save_maps.
     m_save_map_srv = this->create_service<interface::srv::SaveMaps>(
-      "/pgo/save_maps",
+      "save_maps",
       std::bind(&PGONode::saveMapsCB, this, std::placeholders::_1, std::placeholders::_2));
   }
 

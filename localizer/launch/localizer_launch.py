@@ -162,16 +162,9 @@ def launch_setup(context, *args, **kwargs):
     initial_pose = read_initial_pose(config_path)
 
     return [
-        # bag_topics is passed through explicitly rather than left to
-        # pointlio_launch.py's own default, so this launch's behaviour does not
-        # change under it: a real robot needs the /<robot_id>/livox/* topics the
-        # driver publishes.
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(pointlio_launch_file()),
-            launch_arguments={
-                "system_config": config_path,
-                "bag_topics": LaunchConfiguration("bag_topics"),
-            }.items(),
+            launch_arguments={"system_config": config_path}.items(),
         ),
         launch_ros.actions.Node(
             package="localizer",
@@ -195,16 +188,6 @@ def generate_launch_description():
                 "system_config",
                 default_value=DEFAULT_SYSTEM_INI,
                 description="Path to the system INI file providing [system] robot_id",
-            ),
-            DeclareLaunchArgument(
-                "bag_topics",
-                default_value="false",
-                description=(
-                    "Forwarded to pointlio_launch.py: point its lidar/imu "
-                    "remappings at the raw /livox/{lidar,imu} topics instead of "
-                    "/<robot_id>/livox/{lidar,imu}, for replaying rosbags "
-                    "recorded without the robot_id prefix"
-                ),
             ),
             OpaqueFunction(function=launch_setup),
         ]

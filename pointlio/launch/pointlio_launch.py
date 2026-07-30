@@ -63,19 +63,14 @@ def launch_setup(context, *args, **kwargs):
     pkg_pointlio = FindPackageShare("pointlio").find("pointlio")
     params_file = os.path.join(pkg_pointlio, "config", "pointlio.yaml")
 
-    # Bag replay: rosbags recorded before the robot_id topic prefix existed
-    # carry the raw Livox topics (/livox/lidar, /livox/imu), so point the
-    # remappings at those instead of the prefixed ones. Off by default so a real
-    # robot (driver publishes the prefixed topics) is unaffected; enable with
-    # `bag_topics:=true`.
-    bag_topics = LaunchConfiguration("bag_topics").perform(context).lower() in (
-        "true",
-        "1",
-    )
-    livox_prefix = "" if bag_topics else f"/{robot_id}"
+    # A single set of topic names covers both the real robot and bag replay:
+    # every rosbag is now recorded with the robot_id prefix the driver publishes,
+    # so the `bag_topics` argument that used to strip the prefix (pointing the
+    # remappings at the raw /livox/{lidar,imu}) is gone. Bags predating the
+    # prefix need `ros2 bag play --remap` instead of a launch argument.
     remappings = [
-        ("lidar", f"{livox_prefix}/livox/lidar"),
-        ("imu", f"{livox_prefix}/livox/imu"),
+        ("lidar", f"/{robot_id}/livox/lidar"),
+        ("imu", f"/{robot_id}/livox/imu"),
     ]
 
     # Standalone frame names, NOT <robot_id>/laser -> <robot_id>/base_link,
@@ -118,16 +113,6 @@ def generate_launch_description():
                 "system_config",
                 default_value=DEFAULT_SYSTEM_INI,
                 description="Path to the system INI file providing [system] robot_id",
-            ),
-            DeclareLaunchArgument(
-                "bag_topics",
-                default_value="true",
-                description=(
-                    "Point the lidar/imu remappings at the raw "
-                    "/livox/{lidar,imu} topics instead of "
-                    "/<robot_id>/livox/{lidar,imu}, for replaying rosbags "
-                    "recorded without the robot_id prefix"
-                ),
             ),
             OpaqueFunction(function=launch_setup),
         ]

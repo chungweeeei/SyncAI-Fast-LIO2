@@ -21,6 +21,11 @@
   <depend>interface</depend>
   <depend>GTSAM</depend>
 
+  <!-- pgo_launch.py renders the robot_id-prefixed copy of config/pgo.yaml -->
+  <exec_depend>python3-yaml</exec_depend>
+  <!-- pgo_launch.py includes pointlio_launch.py to bring the LIO front end up -->
+  <exec_depend>pointlio</exec_depend>
+
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 
