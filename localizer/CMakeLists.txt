@@ -26,6 +26,9 @@ find_package(pcl_conversions REQUIRED)
 
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
+# small_gicp：ICPLocalizer 的配準後端。src/third-party/small_gicp 是 build_type
+# cmake 的 package，colcon 會先建它並把 lib/cmake/small_gicp 掛進 CMAKE_PREFIX_PATH
+find_package(small_gicp REQUIRED)
 # yaml-cpp is gone: the node reads standard ROS 2 parameters instead of parsing
 # its own YAML (it was also never declared in package.xml)
 
@@ -42,7 +45,11 @@ set(SRC_LIST src/localizers/commons.cpp
 
 add_executable(localizer_node src/localizer_node.cpp ${SRC_LIST})
 ament_target_dependencies(localizer_node rclcpp std_msgs sensor_msgs nav_msgs message_filters pcl_conversions tf2_ros geometry_msgs interface)
-target_link_libraries(localizer_node ${PCL_LIBRARIES})
+# RegistrationPCL 本身是 header-only（pcl_registration.hpp 末尾自己 include
+# impl），連 small_gicp::small_gicp 是為了它 PUBLIC 帶出來的 include path、
+# Eigen3::Eigen 與 OpenMP::OpenMP_CXX——少了 -fopenmp，small_gicp 的 omp pragma
+# 會被無聲忽略，KD-tree 建構與 reduction 全部退回單執行緒（結果一樣，只是慢）
+target_link_libraries(localizer_node ${PCL_LIBRARIES} small_gicp::small_gicp)
 
 
 install(TARGETS localizer_node DESTINATION lib/${PROJECT_NAME})

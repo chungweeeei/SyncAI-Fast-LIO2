@@ -43,16 +43,40 @@
 
     update_hz: 1.0
 
+    # 配準後端是 small_gicp 的 GICP（原本是 pcl::IterativeClosestPoint 的
+    # point-to-point）。num_threads 給協方差估計、KD-tree 建構與 reduction 用；
+    # localizer 跟 pointlio 共用同一顆 CPU，不要開滿。
+    # num_threads 只在建構期讀一次——RegistrationPCL 在 setInputTarget 當下就用
+    # 當時的值建 KD-tree，之後改也不會重建
+    num_threads: 4
+    # 估局部協方差時取的鄰居數，等同 pcl::GICP 的 correspondence randomness
+    num_neighbors: 20
+
     rough_scan_resolution: 0.25
     rough_map_resolution: 0.25
-    rough_max_iteration: 5
+    # small_gicp 的 converged 只有在「更新量小於 eps」時才成立，撞到迭代上限就
+    # 停算 not converged（PCL 的 ICP 撞到上限也回報 converged），而 align() 把
+    # hasConverged() 當硬性條件。所以這裡不能沿用舊的 5 / 10，給太少會變成
+    # score 明明夠好卻一路 return false、TF 永遠不更新。對齊 small_gicp 預設的 20
+    rough_max_iteration: 20
+    # 門檻吃的是 pcl::Registration::getFitnessScore()：配準後 source 對 target
+    # 的最近鄰平均平方距離（m²），跟配準演算法無關，所以換 GICP 之後這兩個值的
+    # 物理意義沒變、可以沿用舊的調校。實際數值會印在 log 的 fitness 欄
     rough_score_thresh: 0.2
     # correspondence 配對距離上限（m）：rough 給大一點吸收 relocalize 手動 guess 的誤差
     rough_max_corr_dist: 2.0
+    # "GICP" 或 "VGICP"。VGICP 對 target 建 voxelmap 而不是 KD-tree，收斂盆地更大，
+    # rough 這段其實更適合它；先維持 GICP 是為了一次只換一個變數，等 GICP 在場地
+    # 驗過再考慮把 rough 開成 VGICP
+    rough_registration_type: "GICP"
+    # 只有 rough_registration_type 是 VGICP 時才會用到（voxelmap 邊長，m）
+    rough_voxel_resolution: 1.0
 
     refine_scan_resolution: 0.1
     refine_map_resolution: 0.1
-    refine_max_iteration: 10
+    refine_max_iteration: 20
     refine_score_thresh: 0.1
     # refine 收緊，只用近距離配對做精配
     refine_max_corr_dist: 0.5
+    refine_registration_type: "GICP"
+    refine_voxel_resolution: 0.5

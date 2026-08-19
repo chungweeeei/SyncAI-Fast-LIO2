@@ -195,6 +195,12 @@ public:
     m_config.initial_pose_yaw =
       declare_parameter<double>("initial_pose.yaw", m_config.initial_pose_yaw);
 
+    // small_gicp 後端的共用參數，兩段配準共享
+    m_localizer_config.num_threads =
+      declare_parameter<int>("num_threads", m_localizer_config.num_threads);
+    m_localizer_config.num_neighbors =
+      declare_parameter<int>("num_neighbors", m_localizer_config.num_neighbors);
+
     m_localizer_config.rough_scan_resolution =
       declare_parameter<double>("rough_scan_resolution", m_localizer_config.rough_scan_resolution);
     m_localizer_config.rough_map_resolution =
@@ -205,6 +211,10 @@ public:
       declare_parameter<double>("rough_score_thresh", m_localizer_config.rough_score_thresh);
     m_localizer_config.rough_max_corr_dist =
       declare_parameter<double>("rough_max_corr_dist", m_localizer_config.rough_max_corr_dist);
+    m_localizer_config.rough_registration_type = declare_parameter<std::string>(
+      "rough_registration_type", m_localizer_config.rough_registration_type);
+    m_localizer_config.rough_voxel_resolution = declare_parameter<double>(
+      "rough_voxel_resolution", m_localizer_config.rough_voxel_resolution);
 
     m_localizer_config.refine_scan_resolution = declare_parameter<double>(
       "refine_scan_resolution", m_localizer_config.refine_scan_resolution);
@@ -216,6 +226,10 @@ public:
       declare_parameter<double>("refine_score_thresh", m_localizer_config.refine_score_thresh);
     m_localizer_config.refine_max_corr_dist =
       declare_parameter<double>("refine_max_corr_dist", m_localizer_config.refine_max_corr_dist);
+    m_localizer_config.refine_registration_type = declare_parameter<std::string>(
+      "refine_registration_type", m_localizer_config.refine_registration_type);
+    m_localizer_config.refine_voxel_resolution = declare_parameter<double>(
+      "refine_voxel_resolution", m_localizer_config.refine_voxel_resolution);
 
     RCLCPP_INFO(
       this->get_logger(), "params: cloud_topic=%s odom_topic=%s map_frame=%s update_hz=%.2f",
