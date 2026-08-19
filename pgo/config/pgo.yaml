@@ -18,3 +18,11 @@ loop_score_tresh: 0.15
 loop_submap_half_range: 5
 submap_resolution: 0.1
 min_loop_detect_duration: 5.0
+
+# "Map so far" cloud published on pgo/map_cloud for the operator console while
+# mapping. Merged from every keyframe's *current* (loop-closure-corrected)
+# global pose on a background thread, so it never stalls the 50 ms timer that
+# owns the map->local_frame TF broadcast. Publishing is subscriber-gated and
+# keyframe-triggered; the period below is a floor on top of that.
+map_cloud_resolution: 0.2   # voxel leaf (m) of the published merge
+map_cloud_pub_period: 3.0   # min seconds between publishes
