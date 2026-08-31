@@ -41,7 +41,12 @@
       y: 0.0
       yaw: 0.0
 
-    update_hz: 1.0
+    # 1.0 → 5.0（2026-08-28 robot01 實測）：1 Hz 時 0.7 m/s 快走的 guess 偏差
+    # 累積一整秒才被一次拉回，map→odom 修正呈階梯狀跳動（單秒最大 0.67 m /
+    # 5.5°，見 record/loc_run_20260828_194142.csv）。每輪 rough+refine 實測只花
+    # 30–50 ms，5 Hz 的佔用仍遠低於一個週期，修正量約縮成 1/5。若和 pointlio
+    # 出現 CPU 搶佔（控制迴圈掉拍），先降回 3.0 而不是動 num_threads
+    update_hz: 5.0
 
     # 配準後端是 small_gicp 的 GICP（原本是 pcl::IterativeClosestPoint 的
     # point-to-point）。num_threads 給協方差估計、KD-tree 建構與 reduction 用；
@@ -65,9 +70,13 @@
     rough_score_thresh: 0.2
     # correspondence 配對距離上限（m）：rough 給大一點吸收 relocalize 手動 guess 的誤差
     rough_max_corr_dist: 2.0
-    # "GICP" 或 "VGICP"。VGICP 對 target 建 voxelmap 而不是 KD-tree，收斂盆地更大，
-    # rough 這段其實更適合它；先維持 GICP 是為了一次只換一個變數，等 GICP 在場地
-    # 驗過再考慮把 rough 開成 VGICP
+    # "GICP" 或 "VGICP"。VGICP 對 target 建 voxelmap 而不是 KD-tree，收斂盆地更
+    # 大，理論上 rough 更適合它。但 2026-08-28 在 robot01 實測 VGICP + 5 Hz 時，
+    # 場地西端一處 y 向約束弱的角落，靜止中位姿在兩個相距 ~0.17 m 的解之間持續
+    # 彈跳（GICP rough 時同處擺盪只有 ~0.13 m，見
+    # record/loc_run_20260828_194142.csv 20:05:30 起）——疑似 1.0 m voxel 在退化
+    # 幾何把 rough 解推進不同吸引盆，refine 兩邊 fitness 都合格。退回 GICP 以
+    # 單獨驗證 update_hz=5.0；等該角落補了幾何特徵再重試 VGICP
     rough_registration_type: "GICP"
     # 只有 rough_registration_type 是 VGICP 時才會用到（voxelmap 邊長，m）
     rough_voxel_resolution: 1.0
