@@ -14,12 +14,17 @@
 #include <yaml-cpp/yaml.h>
 
 #include <atomic>
+#include <chrono>
+#include <future>
+#include <mutex>
 #include <filesystem>
 #include <fstream>
 #include <queue>
 #include <thread>
 
 #include "interface/srv/save_maps.hpp"
+#include "interface/srv/reset_lio.hpp"
+#include "interface/srv/reset_mapping.hpp"
 #include "pgos/commons.h"
 #include "pgos/simple_pgo.h"
 
@@ -35,13 +40,38 @@ struct NodeConfig
   // behaviour, not PGO math, so they live here rather than in Config.
   double map_cloud_resolution = 0.2;
   double map_cloud_pub_period = 3.0;
+  // pointlio's reset service. Absolute, and rewritten per robot_id by
+  // pgo_launch.py for exactly the reason cloud_topic and odom_topic are: it
+  // names something in pointlio's namespace, which a relative name from inside
+  // /<robot_id>/pgo cannot reach. Keeping it in the config is what stops this
+  // file from ever spelling a robot_id.
+  std::string lio_reset_service = "/pointlio/reset";
 };
 
 struct NodeState
 {
   std::mutex message_mutex;
   std::queue<CloudWithPose> cloud_buffer;
-  double last_message_time;
+  // Was uninitialised, so the out-of-order guard in syncCB compared the very
+  // first message against whatever was on the stack. -1.0 is the "no message
+  // seen yet" value, and is also what resetMappingCB puts back.
+  double last_message_time = -1.0;
+
+  // The reset gate. Atomics rather than fields under message_mutex on purpose:
+  // syncCB would otherwise have to take m_pgo_mutex *and* message_mutex in a
+  // fixed order on its hot path, and this file has already proved it cannot be
+  // trusted with one lock (see the lock_guard note below). Two relaxed loads
+  // keep the gate lock-free and remove lock ordering from the design entirely.
+  //
+  // accepting is false for the duration of a reset -- nothing the front end
+  // publishes can reach the graph while pointlio's state is changing, which is
+  // what makes the reset ordering-proof rather than timing-dependent.
+  // accept_after_time then discards the old run's tail: pairs already held by
+  // the message_filters synchroniser, which surface after accepting goes true
+  // again. Both sides of that comparison are the lidar header stamp, so it is
+  // exact -- no clock conversion, no tolerance constant.
+  std::atomic<bool> accepting{true};
+  std::atomic<double> accept_after_time{-1.0};
 };
 
 class PGONode : public rclcpp::Node
@@ -83,6 +113,26 @@ public:
     m_save_map_srv = this->create_service<interface::srv::SaveMaps>(
       "save_maps",
       std::bind(&PGONode::saveMapsCB, this, std::placeholders::_1, std::placeholders::_2));
+
+    // Two dedicated MutuallyExclusive groups, same shape (and the same reason)
+    // as localizer_node's: a handler that blocks must not sit on the group that
+    // owns the 50 ms TF broadcast.
+    //
+    // The client's group is not a nicety, it is what stops a deadlock.
+    // resetMappingCB blocks on the ResetLIO future, so the response has to be
+    // delivered by a DIFFERENT executor thread, which means a different
+    // callback group. (And never spin_until_future_complete from inside a
+    // callback -- that re-enters the executor that is already busy running us.)
+    m_srv_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    m_cli_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
+    m_reset_srv = this->create_service<interface::srv::ResetMapping>(
+      "reset_mapping",
+      std::bind(&PGONode::resetMappingCB, this, std::placeholders::_1, std::placeholders::_2),
+      rmw_qos_profile_services_default, m_srv_cb_group);
+
+    m_lio_reset_cli = this->create_client<interface::srv::ResetLIO>(
+      m_node_config.lio_reset_service, rmw_qos_profile_services_default, m_cli_cb_group);
   }
 
   ~PGONode()
@@ -126,6 +176,9 @@ public:
     if (config["map_cloud_pub_period"]) {
       m_node_config.map_cloud_pub_period = config["map_cloud_pub_period"].as<double>();
     }
+    if (config["lio_reset_service"]) {
+      m_node_config.lio_reset_service = config["lio_reset_service"].as<std::string>();
+    }
   }
 
   void syncCB(
@@ -137,13 +190,36 @@ public:
      * odom_msg: lio odom -> robot pose
      */
 
-    std::lock_guard<std::mutex>(m_state.message_mutex);
+    // Gate before the expensive part: a pair dropped here costs nothing, while
+    // pcl::fromROSMsg below is a full copy of a lidar frame.
+    //
+    // accepting false means a reset is in flight -- see NodeState. Dropping
+    // rather than buffering is the point: anything produced while the front end
+    // is being reset belongs to neither run.
+    if (!m_state.accepting.load()) return;
+
     CloudWithPose cp;
     cp.pose.setTime(cloud_msg->header.stamp.sec, cloud_msg->header.stamp.nanosec);
+
+    // The old run's tail. pointlio reported this boundary as the stamp of the
+    // last odometry it published before resetting, so <= is the whole of the
+    // old run and > is the whole of the new one. Without this, a single
+    // straddling frame anchors a BetweenFactor carrying the entire accumulated
+    // drift at 1e-6 variance, and the graph never recovers.
+    if (cp.pose.second <= m_state.accept_after_time.load()) return;
+
     if (cp.pose.second < m_state.last_message_time) {
       RCLCPP_WARN(this->get_logger(), "Received out of order message");
       return;
     }
+
+    // Was `std::lock_guard<std::mutex>(m_state.message_mutex);` -- with no
+    // declarator-id that parses as a functional cast, so it built a temporary
+    // and released the mutex at the end of that very statement. The buffer was
+    // unguarded, and got away with it only because rclcpp::spin() serialised
+    // syncCB against timerCB. main() now runs a MultiThreadedExecutor, so it
+    // would not get away with it any more.
+    std::lock_guard<std::mutex> lock(m_state.message_mutex);
     m_state.last_message_time = cp.pose.second;
 
     cp.pose.r = Eigen::Quaterniond(
@@ -239,10 +315,21 @@ public:
 
   void timerCB()
   {
-    if (m_state.cloud_buffer.size() == 0) return;
-    CloudWithPose cp = m_state.cloud_buffer.front();  // 只拿最舊的一筆資料
+    // Held for the whole body: everything below reads or mutates m_pgo, which
+    // resetMappingCB replaces wholesale. See the m_pgo_mutex declaration for the
+    // full discipline.
+    std::lock_guard<std::mutex> pgo_lock(m_pgo_mutex);
+
+    CloudWithPose cp;
     {
-      std::lock_guard<std::mutex>(m_state.message_mutex);
+      // front() used to be read OUTSIDE this block, and the block itself used to
+      // be `std::lock_guard<std::mutex>(m_state.message_mutex);` -- a temporary,
+      // so nothing was ever locked. Both are fixed together: the read and the
+      // drain are one critical section against syncCB, which now runs on a
+      // different executor thread.
+      std::lock_guard<std::mutex> lock(m_state.message_mutex);
+      if (m_state.cloud_buffer.empty()) return;
+      cp = m_state.cloud_buffer.front();  // 只拿最舊的一筆資料
       // 把整個 queue 清空
       while (!m_state.cloud_buffer.empty()) {
         m_state.cloud_buffer.pop();
@@ -348,10 +435,169 @@ public:
     m_map_cloud_busy.store(false);
   }
 
+  // Tell every consumer the map is gone. Both are published UNGATED, unlike
+  // their counterparts in the normal path: the subscriber-count check exists to
+  // skip expensive merges nobody wants, but "the map is empty now" is two dozen
+  // bytes and is precisely the message a late or idle subscriber must not miss.
+  // Without these, the last thing rviz and the operator console hold is the map
+  // the operator was just told had been discarded.
+  void publishEmptyMapCloud(const builtin_interfaces::msg::Time & time)
+  {
+    CloudType empty;
+    sensor_msgs::msg::PointCloud2 msg;
+    pcl::toROSMsg(empty, msg);
+    msg.header.frame_id = m_node_config.map_frame;
+    msg.header.stamp = time;
+    m_map_cloud_pub->publish(msg);
+  }
+
+  void publishLoopMarkerDeleteAll()
+  {
+    visualization_msgs::msg::MarkerArray marker_array;
+    visualization_msgs::msg::Marker clear_marker;
+    clear_marker.action = visualization_msgs::msg::Marker::DELETEALL;
+    marker_array.markers.push_back(clear_marker);
+    m_loop_marker_pub->publish(marker_array);
+  }
+
+  // Throw the pose graph away and start a new map, with nothing restarted.
+  //
+  // Four phases, ordered so that the only step which can fail happens before
+  // anything is destroyed. The single reachable partial state is "paused, graph
+  // intact, LIO untouched", and every failure path exits through the resume --
+  // so there is no half-reset for a caller to clean up, and no ordering exposed
+  // to a caller to get wrong.
+  void resetMappingCB(
+    const std::shared_ptr<interface::srv::ResetMapping::Request> request,
+    std::shared_ptr<interface::srv::ResetMapping::Response> response)
+  {
+    // ---- Phase 1: pause. Reversible, and the whole ordering fix. ----
+    //
+    // With accepting false, nothing the front end publishes can reach the graph
+    // while pointlio's state changes underneath us. That is why this design
+    // needs no sleep and no slack window: the odometry discontinuity has
+    // nowhere to land, rather than landing somewhere we hope is harmless.
+    if (m_resetting.exchange(true)) {
+      response->success = false;
+      response->message = "A reset is already running";
+      return;
+    }
+    // RAII so every early return below -- including an exception out of the
+    // client -- clears the flag and re-opens the gate.
+    struct ResumeGuard
+    {
+      PGONode * self;
+      bool committed = false;
+      ~ResumeGuard()
+      {
+        if (!committed) self->m_state.accepting.store(true);
+        self->m_resetting.store(false);
+      }
+    } resume_guard{this};
+
+    m_state.accepting.store(false);
+
+    // ---- Phase 2: reset the front end. The only fallible step, no mutex. ----
+    //
+    // Deliberately outside m_pgo_mutex: this blocks for up to five seconds, and
+    // holding the lock would stall the 50 ms timer -- and with it the
+    // map -> local_frame TF broadcast -- for that whole time.
+    double last_odom_time = 0.0;
+    if (request->reset_lio) {
+      if (!m_lio_reset_cli->wait_for_service(std::chrono::seconds(2))) {
+        response->success = false;
+        response->message =
+          "LIO reset service " + m_node_config.lio_reset_service + " is not available; map kept";
+        RCLCPP_ERROR(this->get_logger(), "[PGONode][resetMappingCB] %s", response->message.c_str());
+        return;
+      }
+
+      auto future = m_lio_reset_cli->async_send_request(
+        std::make_shared<interface::srv::ResetLIO::Request>());
+      if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        response->success = false;
+        response->message = "Timed out waiting for the LIO reset; map kept";
+        RCLCPP_ERROR(this->get_logger(), "[PGONode][resetMappingCB] %s", response->message.c_str());
+        return;
+      }
+
+      auto lio_response = future.get();
+      if (!lio_response->success) {
+        response->success = false;
+        response->message = "LIO refused the reset (" + lio_response->message + "); map kept";
+        RCLCPP_ERROR(this->get_logger(), "[PGONode][resetMappingCB] %s", response->message.c_str());
+        return;
+      }
+      last_odom_time = lio_response->last_odom_time;
+    }
+
+    // ---- Phase 3: reset the graph. Nothing below can fail. ----
+    builtin_interfaces::msg::Time now = this->get_clock()->now();
+    uint32_t dropped = 0;
+    {
+      std::lock_guard<std::mutex> pgo_lock(m_pgo_mutex);
+
+      // NOT for safety -- mergeAndPublishMapCloud works on a by-value snapshot
+      // and never touches m_pgo, so destroying SimplePGO under it was already
+      // fine (the keyframe clouds are refcounted). The join is here so an
+      // in-flight merge cannot publish the OLD map after we publish the empty
+      // one, which would undo the only thing telling consumers the map is gone.
+      if (m_map_cloud_thread.joinable()) m_map_cloud_thread.join();
+      m_map_cloud_busy.store(false);
+      m_last_map_cloud_time = 0.0;
+
+      dropped = static_cast<uint32_t>(m_pgo->keyPoses().size());
+
+      // The constructor IS the reset: fresh ISAM2, empty values and graph,
+      // identity offsets, and the three keyframe vectors empty by virtue of
+      // being a new object. Deliberately not a SimplePGO::reset() method --
+      // gtsam::ISAM2 has no clear, so such a method would be a second
+      // definition of "empty" that has to stay in sync with this one.
+      m_pgo = std::make_shared<SimplePGO>(m_pgo_config);
+
+      {
+        std::lock_guard<std::mutex> lock(m_state.message_mutex);
+        // swap, not a pop() loop: pop() leaves the deque's capacity behind, and
+        // every entry here drags a full body cloud with it.
+        std::queue<CloudWithPose>().swap(m_state.cloud_buffer);
+        m_state.last_message_time = -1.0;
+      }
+      m_state.accept_after_time.store(last_odom_time);
+
+      publishEmptyMapCloud(now);
+      publishLoopMarkerDeleteAll();
+    }
+
+    // ---- Phase 4: resume. ----
+    m_state.accepting.store(true);
+    resume_guard.committed = true;
+
+    response->success = true;
+    response->lio_last_odom_time = last_odom_time;
+    response->dropped_key_poses = dropped;
+    // Rendered verbatim by the operator console, so it is written as UI copy
+    // rather than as a log line -- and it is the LAST place the stillness
+    // warning can land: the dialog warns before the click, but the static IMU
+    // initialisation itself happens in the seconds after this returns.
+    response->message = request->reset_lio
+                          ? "Map discarded. The new one starts building once the "
+                            "lidar has re-levelled — keep the robot still until then."
+                          : "Pose graph reset. The LIO front end was left running.";
+    RCLCPP_WARN(
+      this->get_logger(), "[PGONode][resetMappingCB] %s (dropped %u key poses)",
+      response->message.c_str(), dropped);
+  }
+
   void saveMapsCB(
     const std::shared_ptr<interface::srv::SaveMaps::Request> request,
     std::shared_ptr<interface::srv::SaveMaps::Response> response)
   {
+    // Whole body, like timerCB: this iterates m_pgo->keyPoses() and writes a
+    // multi-MB PCD out of it. A reset waiting behind a save is the correct
+    // outcome -- the save is serialising exactly what the reset is about to
+    // destroy, and letting them interleave would write a half-reset map.
+    std::lock_guard<std::mutex> pgo_lock(m_pgo_mutex);
+
     if (!std::filesystem::exists(request->file_path)) {
       response->success = false;
       response->message = request->file_path + " IS NOT EXISTS!";
@@ -428,6 +674,27 @@ private:
   double m_last_map_cloud_time = 0.0;
   std::thread m_map_cloud_thread;
   rclcpp::Service<interface::srv::SaveMaps>::SharedPtr m_save_map_srv;
+  // The reset surface. m_resetting rejects a second concurrent call outright
+  // rather than queueing it -- two resets in flight would have the second one
+  // reading a boundary timestamp the first had already invalidated.
+  rclcpp::CallbackGroup::SharedPtr m_srv_cb_group;
+  rclcpp::CallbackGroup::SharedPtr m_cli_cb_group;
+  rclcpp::Service<interface::srv::ResetMapping>::SharedPtr m_reset_srv;
+  rclcpp::Client<interface::srv::ResetLIO>::SharedPtr m_lio_reset_cli;
+  std::atomic<bool> m_resetting{false};
+  // Guards m_pgo -- which resetMappingCB REPLACES rather than mutates, so every
+  // reader needs to be excluded, not just every writer. Discipline:
+  //
+  //   timerCB          whole body (addKeyPose, searchForLoopPairs,
+  //                    smoothAndUpdate, the TF broadcast, and the
+  //                    m_map_cloud_busy / m_map_cloud_thread handshake)
+  //   saveMapsCB       whole body (it serialises what a reset would destroy)
+  //   resetMappingCB   phases 1, 3 and 4 -- NEVER while waiting on the LIO
+  //                    future, which would stall the TF broadcast for seconds
+  //
+  // Needed only because main() runs a MultiThreadedExecutor now; under the old
+  // rclcpp::spin() the executor itself provided this exclusion.
+  std::mutex m_pgo_mutex;
   message_filters::Subscriber<sensor_msgs::msg::PointCloud2> m_cloud_sub;
   message_filters::Subscriber<nav_msgs::msg::Odometry> m_odom_sub;
   std::shared_ptr<tf2_ros::TransformBroadcaster> m_tf_broadcaster;
@@ -439,7 +706,23 @@ private:
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<PGONode>());
+  // Named, NOT `add_node(std::make_shared<PGONode>())`. Executor::add_node
+  // stores a weak_ptr, so a temporary shared_ptr dies at the end of that
+  // statement and takes the node with it -- the process then spins forever over
+  // an empty node set, publishing nothing and broadcasting no TF, while looking
+  // alive in `ps`. (rclcpp::spin(make_shared<...>()), which this replaced, is
+  // safe only because the argument outlives the call.) The symptom is a console
+  // with no point cloud and a DDS "Finis." a third of a second after startup.
+  auto node = std::make_shared<PGONode>();
+  // Three threads for three groups, the same arrangement (and the same reason)
+  // as localizer_node: the default group keeps the timer, both subscriptions
+  // and save_maps serialised exactly as rclcpp::spin() did, so nothing about
+  // the steady-state behaviour moves. The other two exist purely so
+  // resetMappingCB can block on a client future without deadlocking itself --
+  // the handler runs on one, its response arrives on the other.
+  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
+  executor.add_node(node);
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }

@@ -5,6 +5,9 @@
 # apply when running pgo_node bare with this file as its config_path.
 cloud_topic: /pointlio/body_cloud
 odom_topic: /pointlio/lio_odom
+# pointlio's reset service, driven by pgo/reset_mapping. Namespaced by the
+# launch file exactly like the two topics above.
+lio_reset_service: /pointlio/reset
 map_frame: map
 # LIO world frame that pgo's map->local_frame TF should correct
 # (matches pointlio's world_frame; original upstream value was "lidar").

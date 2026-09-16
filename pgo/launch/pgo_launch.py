@@ -101,6 +101,10 @@ def generate_pgo_config(robot_id: str) -> str:
     config["cloud_topic"] = f"/{robot_id}/pointlio/body_cloud"
     config["odom_topic"] = f"/{robot_id}/pointlio/lio_odom"
     config["local_frame"] = f"{robot_id}/pointlio_odom"
+    # pgo_node's client for the LIO reset, which reset_mapping drives. Same
+    # reason as the three above: the service lives in pointlio's namespace, so a
+    # relative name from inside /<robot_id>/pgo cannot reach it.
+    config["lio_reset_service"] = f"/{robot_id}/pointlio/reset"
 
     os.makedirs(GENERATED_CONFIG_DIR, exist_ok=True)
     generated = os.path.join(GENERATED_CONFIG_DIR, f"pgo_{robot_id}.yaml")

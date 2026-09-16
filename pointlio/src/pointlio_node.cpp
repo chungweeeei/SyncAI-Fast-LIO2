@@ -14,6 +14,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 
+#include "interface/srv/reset_lio.hpp"
+
 #include "map_builder/commons.h"
 #include "map_builder/map_builder.h"
 #include "tf2_ros/transform_broadcaster.h"
@@ -105,6 +107,14 @@ public:
 
     // register timer
     m_timer = this->create_wall_timer(20ms, std::bind(&PointLIONode::timerCB, this));
+
+    // The node's only service, and its first: throw the solution away and start
+    // over. Relative name, so it lands on /<robot_id>/pointlio/reset -- the
+    // workspace rule, and what lets pgo_node reach it through a config key
+    // instead of spelling a namespace it does not own.
+    m_reset_srv = this->create_service<interface::srv::ResetLIO>(
+      "reset",
+      std::bind(&PointLIONode::resetCB, this, std::placeholders::_1, std::placeholders::_2));
   }
 
   // Everything is a declared ROS parameter, fed by config/pointlio.yaml through
@@ -402,6 +412,13 @@ public:
 
     if (m_builder->status() != BuilderStatus::MAPPING) return;
 
+    // The stamp resetCB hands back to pgo, recorded HERE rather than inside
+    // publishOdometry: that one returns early when nothing is subscribed, and
+    // the ordering gate must not depend on who happens to be listening. Past
+    // this gate the frame is one the solution accepted, which is exactly what
+    // "the last sample of the old run" has to mean.
+    m_last_odom_time = m_package.cloud_end_time;
+
     // world frame -> odom3D
     // body_frame -> laser3D
     broadCastTF(
@@ -426,6 +443,82 @@ public:
     publishPath(m_path_pub, m_node_config.world_frame, m_package.cloud_end_time);
   }
 
+  // Throw the whole solution away and start over, in place.
+  //
+  // Everything below mirrors the constructor -- deliberately, because the
+  // constructor is the only definition of "a node that has not mapped anything
+  // yet" and a second, subtly different one would drift from it. The order
+  // matters twice: last_odom_time is read before anything is cleared (it is the
+  // answer), and the builder is replaced last (dropping it releases the old
+  // LidarProcessor and its ikd-tree, whose destructor joins the tree's rebuild
+  // thread -- the one genuinely blocking step here).
+  //
+  // NO LOCKING against the executor, and that is load-bearing: main() spins this
+  // node with rclcpp::spin(), so every callback shares the default
+  // MutuallyExclusive group and timerCB cannot be halfway through
+  // MapBuilder::process() while the builder is swapped out. Moving this node to
+  // a MultiThreadedExecutor, or putting this service in its own callback group,
+  // breaks that and needs a mutex shared with timerCB. (pgo_node does exactly
+  // that, for a reason that does not apply here: it has to wait on a client
+  // future from inside its handler.) The two sensor mutexes below are a
+  // different matter -- they guard against the subscription callbacks, which are
+  // in the same group but would be a real race the moment anything changes.
+  void resetCB(
+    const std::shared_ptr<interface::srv::ResetLIO::Request> request,
+    std::shared_ptr<interface::srv::ResetLIO::Response> response)
+  {
+    (void)request;  // empty by design -- a reset is not a reconfigure
+
+    // First, before any of it is invalidated: this is the whole point of the
+    // call for pgo, and everything after this line destroys the state that
+    // produced it.
+    response->last_odom_time = m_last_odom_time;
+
+    {
+      std::lock_guard<std::mutex> lock(m_state_data.imu_mutex);
+      std::deque<IMUData>().swap(m_state_data.imu_buffer);
+      m_state_data.last_imu_time = -1.0;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(m_state_data.lidar_mutex);
+      std::deque<std::pair<double, pcl::PointCloud<pcl::PointXYZINormal>::Ptr>>().swap(
+        m_state_data.lidar_buffer);
+      m_state_data.last_lidar_time = -1.0;
+    }
+
+    // Easy to miss and it silently defeats the timestamp gate: syncPackage()
+    // only refills m_package while lidar_pushed is false. A reset landing
+    // between "package assembled" and "package consumed" would otherwise leave
+    // this true, so the first frame of the NEW run reuses the old package --
+    // including its cloud_end_time -- and publishes new-run odometry carrying an
+    // old-run stamp, which is precisely the message pgo's gate is meant to drop.
+    m_state_data.lidar_pushed = false;
+    Vec<IMUData>().swap(m_package.imus);
+    m_package.cloud.reset();
+    m_package.cloud_start_time = 0.0;
+    m_package.cloud_end_time = 0.0;
+
+    // Published unconditionally, unlike publishPath's subscriber-gated send: an
+    // empty Path is what makes rviz drop the old trajectory instead of drawing
+    // the new run appended to the end of the old one.
+    m_state_data.path.poses.clear();
+    m_path_pub->publish(m_state_data.path);
+
+    // The reset proper. Same two lines as the constructor: MapBuilder's ctor
+    // re-runs setConfig on the EKF (which re-identities its covariance), builds
+    // a fresh IMUInitializer and a fresh LidarProcessor -- new ikd-tree -- and
+    // puts the status back to IMU_INIT.
+    m_kf = std::make_shared<PointEKF>();
+    m_builder = std::make_shared<MapBuilder>(m_builder_config, m_kf);
+
+    m_last_odom_time = 0.0;
+
+    response->success = true;
+    response->message = "LIO reset; re-initialising IMU (robot must be still).";
+    RCLCPP_WARN(this->get_logger(), "[PointLIONode][resetCB] %s", response->message.c_str());
+  }
+
 private:
   rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr m_lidar_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_pc2_sub;
@@ -437,6 +530,12 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr m_odom_pub;
 
   rclcpp::TimerBase::SharedPtr m_timer;
+  rclcpp::Service<interface::srv::ResetLIO>::SharedPtr m_reset_srv;
+  // Stamp of the last odometry sample this node published, in the lidar's clock
+  // (the same value that goes into lio_odom's and body_cloud's headers). Kept
+  // only so resetCB can hand it to pgo as the boundary between the two runs;
+  // 0.0 until MAPPING is first reached, and again after every reset.
+  double m_last_odom_time = 0.0;
   StateData m_state_data;
   SyncPackage m_package;
   NodeConfig m_node_config;

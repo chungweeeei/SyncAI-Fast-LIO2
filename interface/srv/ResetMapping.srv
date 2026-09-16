@@ -1,0 +1,44 @@
+# Throw away the map built so far and start a new one, with nothing restarted.
+#
+# Served by pgo_node on the relative name `reset_mapping`, so it lands on
+# <robot_id>/pgo/reset_mapping. This is the operator-facing entry point (the
+# console's "New map" control reaches it through the backend); pgo orchestrates
+# the whole sequence so that a caller makes ONE request and gets ONE verdict,
+# and cannot get the ordering wrong because no ordering is exposed to it.
+#
+# What it does, in order: stop accepting incoming cloud/odom pairs, reset the
+# LIO front end over ResetLIO, rebuild SimplePGO from scratch, then resume with
+# a timestamp gate that discards the old run's tail still sitting in the
+# message_filters synchroniser and the cloud buffer. Pausing FIRST is what makes
+# it robust -- while the front end's state changes, pgo is not consuming, so the
+# odometry discontinuity has nowhere to land.
+#
+# The only fallible step (the ResetLIO round trip) happens before anything is
+# destroyed, so a failure leaves the pose graph exactly as it was and says so.
+# There is no half-reset state to recover from.
+#
+# THE MAP IS NOT SAVED FIRST. pgo holds its keyframes in RAM and save_maps is
+# the only thing that serialises them, so whatever this discards is gone for
+# good short of replaying a bag. Saving first is the caller's decision, kept
+# separate on purpose: the common use is abandoning a run that went wrong in its
+# first thirty seconds, where an automatic save would only litter the catalogue.
+
+# Reset the LIO front end too -- which is what "a new map" means, since the pose
+# graph's origin follows the odometry origin. False resets the pose graph ALONE,
+# leaving pointlio's ikd-tree and odometry running: that is a bag-replay and
+# debugging affordance (a fresh graph over an unchanged odometry stream), and it
+# is NOT what the operator console sends.
+bool reset_lio
+---
+bool success
+string message
+
+# What pointlio reported as its last published odometry stamp, echoed so a
+# caller can correlate logs across the two nodes. 0.0 when reset_lio was false,
+# or when the front end had not reached MAPPING.
+float64 lio_last_odom_time
+
+# How many keyframes were discarded. The receipt that something was actually
+# thrown away: zero means the run had banked nothing yet, which is a materially
+# different outcome from resetting a twenty-minute drive and worth logging.
+uint32 dropped_key_poses

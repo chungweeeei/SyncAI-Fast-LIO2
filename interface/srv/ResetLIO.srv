@@ -1,0 +1,41 @@
+# Reset the Point-LIO front end in place: drop the ikd-tree map, the EKF and the
+# sensor buffers, and re-run the static IMU initialisation, without restarting
+# the process.
+#
+# Served by pointlio_node on the relative name `reset`, so it lands on
+# <robot_id>/pointlio/reset. Nobody calls this directly in normal operation --
+# pgo_node's reset_mapping owns the ordering (see ResetMapping.srv) and this is
+# the second half of it.
+#
+# The request is empty on purpose. A reset is not a reconfigure: ROS parameters
+# and the extrinsics are left exactly as launched, because the thing being
+# thrown away is the map and the trajectory, not how the node is tuned.
+#
+# IMPORTANT, and not enforceable here: the re-initialisation is a *static* one
+# (imu_init_num samples averaged, gravity_align on), so the robot must be
+# STANDING STILL when this lands. A reset issued while it moves yields a
+# gravity-misaligned solution -- a permanently tilted map -- and reports no
+# error, because nothing downstream can tell a bad gravity vector from a good
+# one. Deliberately not gated on a stationarity check: the node cannot
+# distinguish a stationary robot from a gently vibrating one, and refusing a
+# robot that is actually still is worse than warning the operator.
+---
+bool success
+string message
+
+# Sensor-clock stamp of the LAST odometry sample published before this reset
+# took effect, or 0.0 if the node never reached MAPPING (nothing was published,
+# so there is nothing for a consumer to discard).
+#
+# This single field is the entire ordering contract with pgo_node. After the
+# reset the odometry jumps back to the origin, and a pose graph that consumes
+# one message from either side of that jump anchors a BetweenFactor holding the
+# whole accumulated drift -- at 1e-6 variance, which no later optimisation can
+# undo. Everything belonging to the old run carries a stamp <= this value and
+# everything of the new run carries a strictly greater one, so the consumer
+# gates exactly rather than sleeping and hoping.
+#
+# It is the lidar header stamp (m_package.cloud_end_time), which is the same
+# value stamped onto lio_odom and body_cloud. Same clock domain on both sides of
+# the comparison, so a consumer needs no conversion and no tolerance constant.
+float64 last_odom_time

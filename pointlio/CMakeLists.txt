@@ -30,6 +30,9 @@ find_package(sensor_msgs REQUIRED)
 find_package(livox_ros_driver2 REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(geometry_msgs REQUIRED)
+# The workspace-local srv package (yes, it is genuinely named `interface`).
+# pointlio_node serves ResetLIO from it; it has no other use for the package.
+find_package(interface REQUIRED)
 
 find_package(OpenMP QUIET)
 find_package(PCL REQUIRED)
@@ -49,7 +52,7 @@ set(SRC_LIST src/map_builder/commons.cpp
              src/utils.cpp)
 
 add_executable(pointlio_node src/pointlio_node.cpp ${SRC_LIST})
-ament_target_dependencies(pointlio_node rclcpp std_msgs tf2 tf2_ros nav_msgs sensor_msgs livox_ros_driver2 pcl_conversions geometry_msgs)
+ament_target_dependencies(pointlio_node rclcpp std_msgs tf2 tf2_ros nav_msgs sensor_msgs livox_ros_driver2 pcl_conversions geometry_msgs interface)
 target_link_libraries(pointlio_node
   ${PCL_LIBRARIES}
 )
