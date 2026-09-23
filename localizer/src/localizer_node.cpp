@@ -24,8 +24,8 @@ using namespace std::chrono_literals;
 
 struct NodeConfig
 {
-  std::string cloud_topic = "/fastlio2/body_cloud";
-  std::string odom_topic = "/fastlio2/lio_odom";
+  std::string cloud_topic = "/pointlio/body_cloud";
+  std::string odom_topic = "/pointlio/lio_odom";
   std::string map_frame = "map";
   std::string local_frame = "lidar";
   // The [map] pcd from system.ini, passed in by the launch file as a parameter override.

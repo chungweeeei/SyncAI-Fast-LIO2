@@ -45,8 +45,11 @@ repository.
 | `pgo` | `pgo_node` | Keyframe selection, radius-search loop detection with ICP verification, GTSAM iSAM2 smoothing. Broadcasts the `map → local_frame` correction and serves `save_maps` and `reset_mapping`. Publishes the "map so far" merge for the operator console. | active (mapping session) |
 | `localizer` | `localizer_node` | Relocalization against a saved `map.pcd`: rough GICP (0.25 m voxels) then refine GICP (0.1 m) with [small_gicp](https://github.com/koide3/small_gicp) as the backend. Broadcasts `map → local_frame`, serves `relocalize` / `relocalize_check`, listens on `initialpose`. | active (nav session) |
 | `hba` | `hba_node` | Hierarchical bundle adjustment ([HBA](https://github.com/hku-mars/HBA) / [BALM](https://github.com/hku-mars/BALM)) over the patches a `save_maps` with `save_patches: true` wrote. Offline refinement. | shelved, not in any session |
-| `fastlio2` | `lio_node` | The original FAST-LIO2 iterated-ESKF front end. Kept as the reference the `pointlio` package was refactored from; its launch has no `robot_id` handling and its topics are hard-coded. | legacy, not in any session |
 | `interface` | — | The `.srv` definitions the nodes above share: `SaveMaps`, `SavePoses`, `Relocalize`, `IsValid`, `RefineMap`, `ResetLIO`, `ResetMapping`. Distinct from the workspace's `syncai_common`. | active |
+
+The upstream `fastlio2` package (`lio_node`, the iterated-ESKF front end that
+`pointlio` was refactored from) was removed in 2026-09 once Point-LIO was the
+only front end in use; it is in git history.
 
 ## Dependencies
 
@@ -56,8 +59,8 @@ repository.
 | `livox_ros_driver2` (for `CustomMsg`) | `src/third-party/livox_ros_driver2` in the workspace |
 | `small_gicp` v1.0.1 (`localizer`) | `src/third-party/small_gicp` in the workspace, built by colcon as a plain CMake package |
 | GTSAM 4.2.0 (`pgo`, `hba`) | source-built into `/usr/local` by the workspace `Dockerfile` |
-| Sophus 1.22.10 with `SOPHUS_USE_BASIC_LOGGING=ON` (`fastlio2`, `pointlio`, `hba`) | source-built by the workspace `Dockerfile` |
-| `yaml-cpp` (`pgo`, `hba`, `fastlio2`) | apt |
+| Sophus 1.22.10 with `SOPHUS_USE_BASIC_LOGGING=ON` (`pointlio`, `hba`) | source-built by the workspace `Dockerfile` |
+| `yaml-cpp` (`pgo`, `hba`) | apt |
 
 GTSAM and Sophus are the two dependencies `rosdep` does not cover. Recreating
 the robot container from the image restores both; a container that had them
@@ -210,7 +213,7 @@ uses decides how a value can be overridden:
 | Node | Mechanism | Override with |
 |---|---|---|
 | `pointlio_node`, `localizer_node` | Declared ROS parameters; `config/*.yaml` are `/**/<node>:` params files | launch `parameters=[...]`, `--params-file`, `ros2 param set` |
-| `pgo_node`, `hba_node`, `lio_node` | One `config_path` parameter, file hand-parsed with yaml-cpp | editing the file. `pgo_launch.py` rewrites a copy to `/tmp/syncai_pgo/pgo_<robot_id>.yaml` to inject the `robot_id`-dependent keys |
+| `pgo_node`, `hba_node` | One `config_path` parameter, file hand-parsed with yaml-cpp | editing the file. `pgo_launch.py` rewrites a copy to `/tmp/syncai_pgo/pgo_<robot_id>.yaml` to inject the `robot_id`-dependent keys |
 
 Every value that depends on `robot_id` (input topics, TF frames, the LIO reset
 service name, the `/dev/shm` subdirectory) is injected by the launch file. The

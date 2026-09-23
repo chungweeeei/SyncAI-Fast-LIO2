@@ -8,9 +8,8 @@ breaking the things that depend on them.
 
 The FAST-LIO2 / Point-LIO fork of the SyncAI robot: `pointlio` (the LIO front
 end in use), `pgo` (loop closure, map saving, the live map hand-off), `localizer`
-(GICP relocalization against a saved map), `hba` (offline refinement, shelved),
-`fastlio2` (the original iterated-ESKF node, legacy) and `interface` (the shared
-`.srv` files). Forked from `liangheming/FASTLIO2_ROS2`; remote is
+(GICP relocalization against a saved map), `hba` (offline refinement, shelved)
+and `interface` (the shared `.srv` files). Forked from `liangheming/FASTLIO2_ROS2`; remote is
 `chungweeeei/SyncAI-Fast-LIO2`, working branch `dev`.
 
 It lives at `src/third-party/FASTLIO2_ROS2` inside `SyncAI-Robot-Workspace`, put
@@ -52,13 +51,15 @@ commit message and keep the old shape working until the consumers have moved.
 | `pgo` | yes, mapping session | `pgos/simple_pgo.*` is the graph; `pgo_node.cpp` is the shell plus the map-cloud hand-off and the reset orchestration. |
 | `localizer` | yes, nav session | `localizers/icp_localizer.*` wraps `small_gicp::RegistrationPCL`; `localizer_node.cpp` owns the motion gate and the guess paths. |
 | `hba` | no | Upstream code, 4-space indentation, untouched by the workspace `.clang-format`. `src/hba_node copy.cpp` is a stray upstream file that `CMakeLists.txt` does not build. Leave both alone unless the package is revived. |
-| `fastlio2` | no | Reference implementation. `config/lio_isaac.yaml` and its header comment refer to Isaac launches deleted in `890a54e`. Do not "fix" the pointlio behaviour by editing this package. |
 | `interface` | yes | The `.srv` comments are the design record for the reset contract; edit them with the code. |
 
 The Isaac Sim variants (`*_isaac_launch.py`, `pointlio_isaac.yaml`, the
-`pcd_publisher` package) were removed in `890a54e` / `f3f752f`. Recover them from
-git history rather than re-deriving them; `lidar_type: 1` (PointCloud2 input)
-and `imu_acc_scale` still exist in the node for that path.
+`pcd_publisher` package) were removed in `890a54e` / `f3f752f`, and the upstream
+`fastlio2` package (`lio_node`, the iterated-ESKF front end `pointlio` was
+refactored from) followed in 2026-09. Recover any of them from git history
+rather than re-deriving them; `lidar_type: 1` (PointCloud2 input) and
+`imu_acc_scale` still exist in `pointlio_node` for the Isaac path. Comments in
+`pointlio` that say "carried over from fastlio2" refer to that removed package.
 
 ## Three configuration mechanisms, and which nodes use which
 
@@ -74,7 +75,7 @@ This is the most common source of "I changed the value and nothing happened":
    row-major list because ROS parameters have no matrix type, and the node
    validates the length.
 2. **Hand-parsed yaml-cpp behind a single `config_path` parameter** (`pgo_node`,
-   `hba_node`, `lio_node`). Nothing but `config_path` is visible to `ros2 param`;
+   `hba_node`). Nothing but `config_path` is visible to `ros2 param`;
    a missing required key is an `InvalidNode` exception at construction. Because
    values cannot be layered as overrides, `pgo_launch.py` copies `pgo.yaml` to
    `/tmp/syncai_pgo/pgo_<robot_id>.yaml` with the `robot_id`-dependent keys
@@ -199,19 +200,18 @@ makes the path mean the same file; without it the reader gets ENOENT.
 
 ## Conventions
 
-- **English only**, comments and docs included. The workspace translated its
-  last Chinese remnants in 2026-09; this repo still carries Chinese in
-  `localizer_node.cpp`, `localizer.yaml`, `icp_localizer.h`, parts of
-  `pgo_node.cpp`, `pointlio_node.cpp`, `lio_node.cpp` and two launch headers.
-  Anything **new** is written in English; translating a block you are already
-  editing is welcome, mass-translating untouched code is a separate change.
+- **English only**, comments and docs included. The last Chinese comments in
+  this repo (~360 lines across `localizer`, `pgo`, `pointlio` and `hba`) were
+  translated in 2026-09, the same month the workspace finished its own
+  translation. Anything in another language is a
+  regression, log strings included.
 - Comments explain **why**, at the density you see in `pgo_node.cpp` and
   `localizer.yaml`: the bug, the measurement, the rejected alternative, the
   date. A bare tuning change with no rationale is out of place. Tuning notes
   cite the robot and the run (`record/loc_run_YYYYMMDD_HHMMSS.csv` in the
   workspace; that directory is gitignored, so the citation is the only record).
 - Formatting: the workspace root `.clang-format` (ROS 2 style, 100 columns)
-  applies to `pointlio`, `pgo`, `localizer` and `fastlio2`. `hba` is upstream
+  applies to `pointlio`, `pgo` and `localizer`. `hba` is upstream
   4-space code and is left as is. Launch files are linted by the workspace root
   `ruff.toml`.
 - There are **no tests** in this repo beyond the ament linter templates. Behaviour
