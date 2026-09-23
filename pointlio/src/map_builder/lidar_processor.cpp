@@ -20,8 +20,10 @@ LidarProcessor::LidarProcessor(Config &config, std::shared_ptr<PointEKF> kf) : m
 
 void LidarProcessor::trimCloudMap()
 {
-    // 局部滑動地圖，確保 ikd-Tree 不會隨著機器人跑越遠而無限長大，這段邏輯是從 fastlio2 搬過來的
-    // 核心概念： 維持一個邊長 cube_len (300m) 的立方體，機器人快碰到邊界時，把立方體往前推。
+    // Sliding local map: keeps the ikd-Tree from growing without bound as the robot travels
+    // further. This logic was carried over from fastlio2.
+    // Core idea: maintain a cube of side cube_len (300 m) and push it forward when the robot is
+    // about to reach its boundary.
     m_local_map.cub_to_rm.clear();
     const State &state = m_kf->x();
     Eigen::Vector3d pos_lidar = state.t_wi + state.r_wi * state.t_il;
@@ -37,7 +39,7 @@ void LidarProcessor::trimCloudMap()
         return;
     }
     
-    // 檢查要不要把立方體往前推
+    // Check whether the cube needs to be pushed forward
     float dist_to_map_edge[3][2];
     bool need_move = false;
     double det_thresh = m_config.move_thresh * m_config.det_range;
@@ -52,7 +54,7 @@ void LidarProcessor::trimCloudMap()
     if (!need_move)
         return;
     
-    // 推立方體 + 標記要刪的區塊
+    // Push the cube and mark the boxes to delete
     BoxPointType new_corner, temp_corner;
     new_corner = m_local_map.local_map_corner;
     float mov_dist = std::max((m_config.cube_len - 2.0 * m_config.move_thresh * m_config.det_range) * 0.5 * 0.9, double(m_config.det_range * (m_config.move_thresh - 1)));
@@ -80,7 +82,7 @@ void LidarProcessor::trimCloudMap()
     PointVec points_history;
     m_ikdtree->acquire_removed_points(points_history);
 
-    // 删除局部地图之外的点云
+    // Delete the points outside the local map
     if (m_local_map.cub_to_rm.size() > 0)
         m_ikdtree->Delete_Point_Boxes(m_local_map.cub_to_rm);
     return;
@@ -91,14 +93,15 @@ void LidarProcessor::incrCloudMap()
     if (m_cloud_down_lidar->empty())
         return;
         
-    // m_cloud_down_world 已在 processGroup / updateChunk 內用「各點群自己時間點
-    // 的狀態」轉好 (point-by-point 等效去畸變)，這裡直接使用不再重算。
+    // m_cloud_down_world was already transformed inside processGroup / updateChunk with the state
+    // at each point group's own time (equivalent to point-by-point undistortion), so it is used
+    // as is here and not recomputed.
     int size = m_cloud_down_lidar->size();
     PointVec point_to_add;
     PointVec point_no_need_downsample;
     for (int i = 0; i < size; i++)
     {
-        // 如果该点附近没有近邻点则需要添加到地图中
+        // A point with no neighbours nearby must be added to the map
         if (m_nearest_points[i].empty())
         {
             point_to_add.push_back(m_cloud_down_world->points[i]);
@@ -112,7 +115,7 @@ void LidarProcessor::incrCloudMap()
         mid_point.y = std::floor(m_cloud_down_world->points[i].y / m_config.map_resolution) * m_config.map_resolution + 0.5 * m_config.map_resolution;
         mid_point.z = std::floor(m_cloud_down_world->points[i].z / m_config.map_resolution) * m_config.map_resolution + 0.5 * m_config.map_resolution;
 
-        // 如果该点所在的voxel没有点，则直接加入地图，且不需要降采样
+        // If the voxel this point falls in holds no point yet, add it directly without downsampling
         if (fabs(points_near[0].x - mid_point.x) > 0.5 * m_config.map_resolution && fabs(points_near[0].y - mid_point.y) > 0.5 * m_config.map_resolution && fabs(points_near[0].z - mid_point.z) > 0.5 * m_config.map_resolution)
         {
             point_no_need_downsample.push_back(m_cloud_down_world->points[i]);
@@ -122,10 +125,11 @@ void LidarProcessor::incrCloudMap()
 
         for (int readd_i = 0; readd_i < m_config.near_search_num; readd_i++)
         {
-            // 如果该点的近邻点较少，则需要加入到地图中
+            // A point with too few neighbours must be added to the map
             if (points_near.size() < static_cast<size_t>(m_config.near_search_num))
                 break;
-            // 如果该点的近邻点距离voxel中心点的距离比该点距离voxel中心点更近，则不需要加入该点
+            // If a neighbour lies closer to the voxel centre than this point does, this point
+            // need not be added
             if (sq_dist(points_near[readd_i], mid_point) < dist)
             {
                 need_add = false;
@@ -146,7 +150,8 @@ void LidarProcessor::initCloudMap(PointVec &point_vec)
 
 void LidarProcessor::preprocess(SyncPackage &package, Vec<PointGroup> &groups)
 {
-    // VoxelGrid 降採樣的 voxel 大小套用在「 進入 EKF 之前」的該幀點雲上
+    // The VoxelGrid downsampling voxel size is applied to this frame's point cloud before it
+    // enters the EKF
     if (m_config.scan_resolution > 0.0)
     {
         m_scan_filter.setInputCloud(package.cloud);
@@ -157,12 +162,13 @@ void LidarProcessor::preprocess(SyncPackage &package, Vec<PointGroup> &groups)
         pcl::copyPointCloud(*package.cloud, *m_cloud_down_lidar);
     }
 
-    // voxel filter 不保留時間順序，重新依 curvature (每點時間偏移 ms) 排序
+    // The voxel filter does not preserve time order; re-sort by curvature (per-point time offset
+    // in ms)
     std::sort(m_cloud_down_lidar->points.begin(), m_cloud_down_lidar->points.end(),
               [](const PointType &p1, const PointType &p2)
               { return p1.curvature < p2.curvature; });
 
-    // 構成五個平行陣列 -> 全部都可以透過同一個 index
+    // These form five parallel arrays, all addressed by the same index
     int size = m_cloud_down_lidar->size();
     if (static_cast<int>(m_cloud_down_world->size()) < size)
     {
@@ -172,7 +178,7 @@ void LidarProcessor::preprocess(SyncPackage &package, Vec<PointGroup> &groups)
         m_point_selected_flag.resize(size, false);
     }
 
-    // time compressing: 相同時間戳的點分成一組
+    // time compressing: points sharing one timestamp form a group
     groups.clear();
     int begin = 0;
     for (int i = 1; i <= size; i++)
@@ -264,7 +270,8 @@ void LidarProcessor::updateChunk(int begin, int end)
 
     m_kf->updateLidar(m_H, m_z, effect_num);
 
-    // 用更新後的狀態重轉這個 chunk 的 world 座標，供 incrCloudMap 插入地圖
+    // Re-transform this chunk to world coordinates with the updated state, for incrCloudMap to
+    // insert into the map
     const State &post = m_kf->x();
     for (int i = begin; i < end; i++)
     {

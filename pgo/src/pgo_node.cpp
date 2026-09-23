@@ -413,8 +413,8 @@ public:
     const nav_msgs::msg::Odometry::ConstSharedPtr & odom_msg)
   {
     /**
-     * cloud_msg: lio odom frame 上的 pointcloud
-     * odom_msg: lio odom -> robot pose
+     * cloud_msg: point cloud in the LIO odom frame
+     * odom_msg: LIO odom -> robot pose
      */
 
     // Gate before the expensive part: a pair dropped here costs nothing, while
@@ -556,8 +556,8 @@ public:
       // different executor thread.
       std::lock_guard<std::mutex> lock(m_state.message_mutex);
       if (m_state.cloud_buffer.empty()) return;
-      cp = m_state.cloud_buffer.front();  // 只拿最舊的一筆資料
-      // 把整個 queue 清空
+      cp = m_state.cloud_buffer.front();  // Take only the oldest entry
+      // Drain the whole queue
       while (!m_state.cloud_buffer.empty()) {
         m_state.cloud_buffer.pop();
       }
@@ -567,23 +567,24 @@ public:
     cur_time.sec = cp.pose.sec;
     cur_time.nanosec = cp.pose.nsec;
 
-    if (!m_pgo->addKeyPose(cp)) {  // 挑關鍵幀
-      sendBroadCastTF(cur_time);   // 不是關鍵幀 -> 只發送 transform
+    if (!m_pgo->addKeyPose(cp)) {  // Keyframe selection
+      sendBroadCastTF(cur_time);   // Not a keyframe -> only broadcast the transform
       return;
     }
 
-    // 找回環
+    // Search for loop closures
     m_pgo->searchForLoopPairs();
 
-    // 圖優化
+    // Graph optimisation
     m_pgo->smoothAndUpdate();
 
-    // 發transform
+    // Broadcast the transform
     sendBroadCastTF(cur_time);
 
     publishLoopMarkers(cur_time);
 
-    // 只有 keyframe tick 會走到這裡 — 也正是合併地圖真的有變化的時刻。
+    // Only a keyframe tick reaches this point -- which is exactly when the merged map has
+    // actually changed.
     publishMapCloud(cur_time);
   }
 
@@ -637,7 +638,8 @@ public:
   void mergeAndPublishMapCloud(
     std::vector<KeyPoseWithCloud> snapshot, builtin_interfaces::msg::Time time, uint64_t seq)
   {
-    // 同 saveMapsCB 的合併: 逐 keyframe 用 (r_global, t_global) 轉到 map frame 疊加。
+    // Same merge as saveMapsCB: each keyframe is transformed into the map frame with its
+    // (r_global, t_global) and stacked.
     CloudType::Ptr merged(new CloudType);
     for (const auto & kp : snapshot) {
       CloudType::Ptr world_cloud(new CloudType);
@@ -861,9 +863,9 @@ public:
     }
 
     std::filesystem::path p_dir(request->file_path);
-    std::filesystem::path patches_dir = p_dir / "patches";       // 分片點雲資料夾
-    std::filesystem::path poses_txt_path = p_dir / "poses.txt";  // 每幀位姿清單
-    std::filesystem::path map_path = p_dir / "map.pcd";          // 合併後完整地圖
+    std::filesystem::path patches_dir = p_dir / "patches";       // per-keyframe patch clouds
+    std::filesystem::path poses_txt_path = p_dir / "poses.txt";  // per-frame pose list
+    std::filesystem::path map_path = p_dir / "map.pcd";          // the merged full map
 
     if (request->save_patches) {
       if (std::filesystem::exists(patches_dir)) {
@@ -898,12 +900,12 @@ public:
         *body_cloud, *world_cloud, m_pgo->keyPoses()[i].t_global,
         Eigen::Quaterniond(m_pgo->keyPoses()[i].r_global));
 
-      // 疊近合併地圖
+      // Stack into the merged map
       *ret += *world_cloud;
     }
     txt_file.close();
 
-    // 存完整地圖
+    // Save the full map
     pcl::io::savePCDFileBinary(map_path.string(), *ret);
     response->success = true;
     response->message = "SAVE SUCCESS!";

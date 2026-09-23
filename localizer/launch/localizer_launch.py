@@ -13,13 +13,16 @@
 #
 # pointlio is NOT declared here — this launch includes pointlio_launch.py. It
 # used to spawn pointlio_node itself with a `config_path` parameter pointing at a
-# /tmp rewrite of pointlio.yaml, which是 pointlio_node 還自己用 yaml-cpp 解析
-# 設定檔的年代留下來的。那個 node 早就改成純 ROS parameters + 相對 topic 名稱
-# ("lidar" / "imu") 加 launch remapping，於是這裡的 config_path 變成一個沒人讀的
-# 參數：pointlio 全套調參退回 struct defaults，訂閱退回相對名稱解出來的
-# /<robot_id>/pointlio/{lidar,imu}（沒有任何 publisher），LIO 收不到一筆資料，
-# 不發 odom / body_cloud / TF，localizer 也就永遠沒有輸入可以定位。
-# 用 include 而不是複製一份 Node 定義，就是為了不再有第二份會走鐘的定義。
+# /tmp rewrite of pointlio.yaml, a leftover from the days when pointlio_node
+# still parsed its config file with yaml-cpp itself. That node moved to pure ROS
+# parameters plus relative topic names ("lidar" / "imu") with launch remappings
+# long ago, which turned the config_path here into a parameter nobody reads: the
+# whole pointlio tuning fell back to the struct defaults, and the subscriptions
+# fell back to the relative names resolved as /<robot_id>/pointlio/{lidar,imu}
+# (which have no publisher at all), so LIO received not a single message,
+# published no odom / body_cloud / TF, and the localizer never had any input to
+# localize with. Including rather than copying the Node definition is precisely
+# so there is no longer a second definition that can drift out of step.
 #
 # The [map] pcd from the same INI is mandatory: the localizer loads it during
 # construction, so a missing file means neither node starts. The optional
@@ -145,12 +148,15 @@ def launch_setup(context, *args, **kwargs):
     config_path = LaunchConfiguration("system_config").perform(context)
     robot_id = read_robot_id(config_path)
 
-    # 地圖是硬需求：localizer 在建構期就 loadMap（見 localizer_node.cpp 的
-    # loadInitialMap），沒有地圖整條 3D 定位鏈都做不了事。所以缺檔就一個 node
-    # 都不啟動（等同回傳空的 LaunchDescription）——比讓 localizer 起來、
-    # 之後每次 relocalize / initialpose 都失敗要好判斷。
-    # 檢查放在這裡而不是 generate_launch_description()，是因為 INI 路徑來自
-    # system_config launch argument，只有進到 context 才解得出值。
+    # The map is a hard requirement: the localizer calls loadMap during
+    # construction (see loadInitialMap in localizer_node.cpp), and without a map
+    # the whole 3D localization chain can do nothing. So when the file is missing
+    # no node is started at all (equivalent to returning an empty
+    # LaunchDescription) — easier to diagnose than a localizer that comes up and
+    # then fails every relocalize / initialpose. The check lives here rather than
+    # in generate_launch_description() because the INI path comes from the
+    # system_config launch argument, whose value can only be resolved inside the
+    # context.
     map_pcd = read_map_pcd(config_path)
     if not map_pcd:
         logger.error(f"No [map] pcd in '{config_path}'; nothing to launch")

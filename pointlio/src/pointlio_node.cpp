@@ -275,11 +275,14 @@ public:
   {
     if (m_state_data.imu_buffer.empty() || m_state_data.lidar_buffer.empty()) return false;
 
-    // 一幀 lidar 並不是一收到就處理，必須等到 IMU 「補齊」到掃描結束時刻才行。
+    // A lidar frame is not processed as soon as it arrives; it has to wait until the IMU data
+    // has caught up to the end-of-scan time.
     if (!m_state_data.lidar_pushed) {
       m_package.cloud = m_state_data.lidar_buffer.front().second;
 
-      // pointcloud 中的 curvature 欄位被用來存放每一點的時間搓, 排序目的就是讓 pointcloud 最後一個點是最晚的點否則就只是點雲陣列的最後一個元素與時間無關
+      // The point cloud's curvature field holds each point's timestamp. Sorting makes the last
+      // point of the cloud the latest one; otherwise it is merely the last element of the array,
+      // with no relation to time.
       std::sort(
         m_package.cloud->points.begin(), m_package.cloud->points.end(),
         [](PointType & p1, PointType & p2) { return p1.curvature < p2.curvature; });
@@ -290,21 +293,21 @@ public:
       m_state_data.lidar_pushed = true;
     }
 
-    // 如果 IMU 資料還無法涵蓋一幀的 pointcloud 就先等待 (point-by-point 更新需要
-    // 整幀期間的 IMU 事件)
+    // Wait while the IMU data does not yet cover the whole point cloud frame (the point-by-point
+    // update needs the IMU events for the entire frame)
     if (m_state_data.last_imu_time < m_package.cloud_end_time) return false;
 
-    // 清空 + 釋放 m_package 中的 imu 資料
+    // Clear and release the IMU data held in m_package
     Vec<IMUData>().swap(m_package.imus);
 
-    // 將該幀需要用的 IMU 資料撈出來並把 imu_buffer 清乾淨
+    // Pull out the IMU data this frame needs and drain it from imu_buffer
     while (!m_state_data.imu_buffer.empty() && m_state_data.imu_buffer.front().time < m_package.cloud_end_time) {
-      // 把需要用到的 imu 資料塞回 m_package.
+      // Push the IMU samples this frame needs into m_package.
       m_package.imus.emplace_back(m_state_data.imu_buffer.front());
       m_state_data.imu_buffer.pop_front();
     }
 
-    // 清除用到的那幀 lidar 資料
+    // Drop the lidar frame that has just been consumed
     m_state_data.lidar_buffer.pop_front();
     m_state_data.lidar_pushed = false;
     return true;
@@ -345,7 +348,7 @@ public:
     odom.twist.twist.linear.y = vel.y();
     odom.twist.twist.linear.z = vel.z();
 
-    // output model 直接估測角速度, 一併輸出
+    // The output model estimates angular velocity directly, so publish it as well
     odom.twist.twist.angular.x = m_kf->x().omg.x();
     odom.twist.twist.angular.y = m_kf->x().omg.y();
     odom.twist.twist.angular.z = m_kf->x().omg.z();
@@ -381,8 +384,8 @@ public:
     transformStamped.child_frame_id = child_frame;
     transformStamped.header.stamp = Utils::getTime(time);
 
-    // 下標 wi 讀作 w ← i，右到左：「從 i 到 w」。跟 r_il 是 i ← l（lidar → IMU）
-    // 完整的鏈：lidar 系 ──T_il──> IMU 系 ──T_wi──> 世界系
+    // The subscript wi reads w <- i, right to left: "from i to w". Likewise r_il is i <- l
+    // (lidar -> IMU). The full chain: lidar frame --T_il--> IMU frame --T_wi--> world frame
     Eigen::Quaterniond q(m_kf->x().r_wi);
     V3D t = m_kf->x().t_wi;
 
@@ -432,8 +435,9 @@ public:
       m_builder->lidar_processor()->transformCloud(m_package.cloud, m_kf->x().r_il, m_kf->x().t_il);
     publishCloud(m_body_cloud_pub, body_cloud, m_node_config.body_frame, m_package.cloud_end_time);
 
-    // 注意: world_cloud 是整幀用「掃描結束時刻」的 pose 轉換的, 僅供顯示;
-    // 進地圖的點是 point-by-point 在各自時間點轉換的 (lidar_processor)。
+    // Note: world_cloud transforms the whole frame with the end-of-scan pose and is for display
+    // only; the points that go into the map are transformed point-by-point at their own
+    // timestamps (lidar_processor).
     CloudType::Ptr world_cloud = m_builder->lidar_processor()->transformCloud(
       m_package.cloud, m_builder->lidar_processor()->r_wl(), m_builder->lidar_processor()->t_wl());
     publishCloud(

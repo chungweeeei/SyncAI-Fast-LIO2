@@ -6,16 +6,19 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl/filters/voxel_grid.h>
 
-// 配準從 pcl::IterativeClosestPoint（point-to-point）換成 small_gicp 的 GICP。
-// RegistrationPCL 繼承自 pcl::Registration，setInputTarget / setInputSource /
+// Registration was switched from pcl::IterativeClosestPoint (point-to-point) to small_gicp's GICP.
+// RegistrationPCL derives from pcl::Registration, and setInputTarget / setInputSource /
 // setMaximumIterations / setMaxCorrespondenceDistance / align / hasConverged /
-// getFinalTransformation / getFitnessScore 都在，所以 align() 的流程沒有改動。
-// 換掉的理由是收斂品質而不是速度（update_hz 只有 1）：MID360 的 scan 相對地圖
-// 稀疏且分布不均，point-to-point 在長走廊 / 大面牆這種幾何退化方向容易沿著牆滑，
-// GICP 的 distribution-to-distribution 用局部協方差把那個方向壓住；對 scan 與
-// map 兩邊 voxel 解析度不一致（0.25/0.1）的容忍度也高很多。
-// 標頭全 header-only（pcl_registration.hpp 末尾自己 include impl），連結
-// small_gicp::small_gicp 只是為了拿 include path 與 OpenMP 旗標。
+// getFinalTransformation / getFitnessScore are all there, so the flow of align() is unchanged.
+// The reason for the switch is convergence quality, not speed (a rough + refine round takes
+// 30-50 ms, well under the 200 ms period of today's update_hz of 5.0):
+// a MID360 scan is sparse and unevenly distributed relative to the map, and point-to-point tends
+// to slide along the wall in degenerate-geometry directions such as long corridors / large flat
+// walls, whereas GICP's distribution-to-distribution uses the local covariance to pin that
+// direction down; it is also far more tolerant of the mismatched voxel resolutions on the scan and
+// map sides (0.25/0.1).
+// The headers are entirely header-only (pcl_registration.hpp includes the impl itself at the end);
+// linking small_gicp::small_gicp is only for the include path and the OpenMP flags.
 #include <small_gicp/pcl/pcl_registration.hpp>
 
 struct ICPConfig
@@ -23,17 +26,19 @@ struct ICPConfig
     double refine_scan_resolution = 0.1;
     double refine_map_resolution = 0.1;
     double refine_score_thresh = 0.1;
-    // small_gicp 的 converged 是「更新量小於 eps」才成立，撞到 max_iteration
-    // 就停算 not converged（PCL 的 ICP 是撞到上限也回報 converged）；而
-    // align() 把 hasConverged() 當硬性條件，迭代數給太少會變成分數明明夠好卻
-    // 一路 return false、TF 永遠不更新。所以這裡對齊 small_gicp 自己的預設 20
+    // small_gicp only reports converged when the update falls below eps; hitting max_iteration
+    // stops as not converged (PCL's ICP reports converged even when it hits the limit). Since
+    // align() treats hasConverged() as a hard condition, too few iterations means a perfectly good
+    // score still returns false every round and the TF never updates. Hence aligned with
+    // small_gicp's own default of 20.
     int refine_max_iteration = 20;
     double refine_max_corr_dist = 0.5;
-    // "GICP" 或 "VGICP"。VGICP 對 target 建 voxelmap 而不是 KD-tree，收斂盆地
-    // 更大，適合 rough 這段吸收 relocalize 手動 guess 的誤差；預設兩段都先維持
-    // GICP，一次只換一個變數，確認 GICP 在場地裡的表現後再考慮 rough 開 VGICP
+    // "GICP" or "VGICP". VGICP builds a voxelmap of the target instead of a KD-tree and has a
+    // larger basin of attraction, which suits the rough stage's job of absorbing the error of a
+    // hand-entered relocalize guess. Both stages default to GICP for now: change one variable at a
+    // time, and only consider VGICP for rough once GICP's behaviour on site has been confirmed.
     std::string refine_registration_type = "GICP";
-    // 只有 registration_type 是 VGICP 時才會用到
+    // Only used when registration_type is VGICP.
     double refine_voxel_resolution = 0.5;
 
     double rough_scan_resolution = 0.25;
@@ -44,11 +49,11 @@ struct ICPConfig
     std::string rough_registration_type = "GICP";
     double rough_voxel_resolution = 1.0;
 
-    // GICP 的協方差估計與 reduction 都吃這個執行緒數。localizer 跟 pointlio
-    // 共用同一顆 CPU，不要開滿
+    // Thread count for GICP's covariance estimation and reduction. The localizer shares one CPU
+    // with pointlio, so do not use every core.
     int num_threads = 4;
-    // 估每個點的局部協方差時取的鄰居數（等同 pcl::GICP 的 correspondence
-    // randomness）。小於 5 會被 small_gicp 夾回 5
+    // Number of neighbors used to estimate each point's local covariance (the same as pcl::GICP's
+    // correspondence randomness). Values below 5 are clamped back to 5 by small_gicp.
     int num_neighbors = 20;
 };
 
@@ -73,8 +78,9 @@ public:
         std::lock_guard<std::mutex> lock(m_target_mutex);
         return m_refine_tgt;
     }
-    // 地圖只會透過 relocalize 的 loadMap() 進來；載入前 align() 一律失敗，
-    // initialpose 等來源可先用這個判斷，避免無聲吞掉 guess
+    // The map only ever arrives through relocalize's loadMap(); before it is loaded align() always
+    // fails, so sources such as initialpose can check this first instead of silently swallowing
+    // the guess.
     bool isMapLoaded()
     {
         std::lock_guard<std::mutex> lock(m_target_mutex);
