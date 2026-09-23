@@ -105,6 +105,10 @@ def generate_pgo_config(robot_id: str) -> str:
     # reason as the three above: the service lives in pointlio's namespace, so a
     # relative name from inside /<robot_id>/pgo cannot reach it.
     config["lio_reset_service"] = f"/{robot_id}/pointlio/reset"
+    # Per-robot subdirectory of the shared tmpfs the merged map cloud is handed
+    # to the backend through (see map_cloud_dir in pgo.yaml). Two robots on one
+    # host (sim) must not prune each other's files.
+    config["map_cloud_dir"] = f"{config.get('map_cloud_dir', '/dev/shm/syncai_pgo')}/{robot_id}"
 
     os.makedirs(GENERATED_CONFIG_DIR, exist_ok=True)
     generated = os.path.join(GENERATED_CONFIG_DIR, f"pgo_{robot_id}.yaml")

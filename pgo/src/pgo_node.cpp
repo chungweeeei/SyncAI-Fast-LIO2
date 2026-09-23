@@ -5,22 +5,33 @@
 #include <message_filters/synchronizer.h>
 #include <nav_msgs/msg/odometry.hpp>
 #include <pcl/common/io.h>
+#include <pcl/exceptions.h>
+#include <pcl/io/pcd_io.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <cstdio>
 #include <future>
 #include <mutex>
 #include <filesystem>
 #include <fstream>
 #include <queue>
+#include <sstream>
+#include <stdexcept>
+#include <system_error>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "interface/srv/save_maps.hpp"
 #include "interface/srv/reset_lio.hpp"
@@ -40,6 +51,12 @@ struct NodeConfig
   // behaviour, not PGO math, so they live here rather than in Config.
   double map_cloud_resolution = 0.2;
   double map_cloud_pub_period = 3.0;
+  // Where the merge is handed to the operator console's backend as a FILE
+  // (see mergeAndPublishMapCloud). A tmpfs the backend's container shares
+  // (`ipc: host` on both compose services -- a private /dev/shm is 64 MB, too
+  // small for two merges of a large site). pgo_launch.py appends /<robot_id>
+  // so two robots on one host never share a directory.
+  std::string map_cloud_dir = "/dev/shm/syncai_pgo";
   // pointlio's reset service. Absolute, and rewritten per robot_id by
   // pgo_launch.py for exactly the reason cloud_topic and odom_topic are: it
   // names something in pointlio's namespace, which a relative name from inside
@@ -95,8 +112,27 @@ public:
     // Relative like loop_markers, so it lands on /<robot_id>/pgo/map_cloud.
     // Depth 1: each message is a multi-MB full-map merge and only the latest
     // matters — queueing old merges would just hold memory.
+    //
+    // Kept for rviz (pgo.rviz) and `ros2 topic echo`; the operator console's
+    // backend no longer reads it. A large site's merge is 16-45 MB, and over
+    // CycloneDDS/UDP on `lo` that is tens of thousands of datagrams in one
+    // burst into a socket buffer capped by net.core.rmem_max (208 KB by
+    // default) -- fragments drop, and a BEST_EFFORT reader loses the whole
+    // sample, so the preview simply stopped once the map grew. Hence the
+    // second output below.
     m_map_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
       "map_cloud", rclcpp::QoS(1));
+    // The file hand-off: the merge is written as a binary PCD into
+    // map_cloud_dir and this ~200 B JSON notice names it (see
+    // mapCloudNoticeJson for the fields). RELIABLE + TRANSIENT_LOCAL depth 1:
+    // latching a notice is free, and it means a backend (re)started
+    // mid-mapping gets the current map at once instead of waiting for the next
+    // keyframe. The reader must request TRANSIENT_LOCAL too, or nothing is
+    // replayed. An empty-map notice (reset) replaces the latched one, so a late
+    // joiner never learns about a file that has been deleted.
+    m_map_cloud_file_pub = this->create_publisher<std_msgs::msg::String>(
+      "map_cloud_file", rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
+    setupMapCloudDir();
     m_tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
     m_sync = std::make_shared<
       message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<
@@ -140,6 +176,194 @@ public:
     // A merge may still be running on the worker; joining here keeps shutdown
     // from tearing the publisher down under it.
     if (m_map_cloud_thread.joinable()) m_map_cloud_thread.join();
+    // Best effort: the files are ours and nobody else will ever remove them
+    // (the dir is the host's tmpfs, so it outlives this container). A stale
+    // notice pointing here after we are gone is the reader's ENOENT to skip.
+    clearMapCloudDir();
+  }
+
+  // ---- The file hand-off (see the map_cloud_file publisher) ----------------
+
+  void setupMapCloudDir()
+  {
+    m_map_cloud_dir = m_node_config.map_cloud_dir;
+    std::error_code ec;
+    std::filesystem::create_directories(m_map_cloud_dir, ec);
+    if (ec) {
+      // Not fatal on purpose: this node also owns the map->local_frame TF
+      // broadcast, and a preview must never take that down. The PointCloud2
+      // path keeps working; the file path is simply disabled for this run.
+      RCLCPP_ERROR(
+        this->get_logger(), "[PGONode] cannot create map_cloud_dir %s (%s); the map_cloud_file "
+        "hand-off is disabled for this run", m_map_cloud_dir.c_str(), ec.message().c_str());
+      m_map_cloud_dir_ok = false;
+      return;
+    }
+    m_map_cloud_dir_ok = true;
+    // A crash leaves files behind, and they would otherwise accumulate across
+    // runs (nothing but this node ever deletes them). Ours only: files this
+    // node's naming produced, never the directory itself.
+    clearMapCloudDir();
+    RCLCPP_INFO(
+      this->get_logger(), "[PGONode] map_cloud merges are handed off as PCD files under %s",
+      m_map_cloud_dir.c_str());
+  }
+
+  static bool isMapCloudFile(const std::filesystem::directory_entry & entry)
+  {
+    // error_code overload: this runs from the destructor too, where a throw
+    // out of a stat() would be fatal rather than merely a file left behind.
+    std::error_code ec;
+    if (!entry.is_regular_file(ec) || ec) return false;
+    const std::string name = entry.path().filename().string();
+    if (name.rfind("map_cloud_", 0) != 0) return false;
+    const std::string ext = entry.path().extension().string();
+    return ext == ".pcd" || ext == ".tmp";
+  }
+
+  // Remove every file this node wrote. Errors are ignored: the caller is a
+  // reset or shutdown, and there is nothing useful to do about a file that
+  // will not go away except log it.
+  void clearMapCloudDir()
+  {
+    if (!m_map_cloud_dir_ok) return;
+    std::error_code ec;
+    for (const auto & entry : std::filesystem::directory_iterator(m_map_cloud_dir, ec)) {
+      if (!isMapCloudFile(entry)) continue;
+      std::error_code rm_ec;
+      std::filesystem::remove(entry.path(), rm_ec);
+      if (rm_ec) {
+        RCLCPP_WARN(
+          this->get_logger(), "[PGONode] could not remove %s: %s", entry.path().c_str(),
+          rm_ec.message().c_str());
+      }
+    }
+  }
+
+  // Keep the newest two `map_cloud_<seq>.pcd` by seq, delete the rest, and
+  // delete any stray `.tmp` (a write that never reached rename). Two, not one:
+  // the backend's reader is KEEP_LAST 1, so the notice it is acting on can be
+  // at most one behind the one just published, and the file it names must
+  // still exist when it opens it. (An already-open file survives unlink on
+  // Linux, so mid-read is safe regardless.) By seq rather than "seq - 2":
+  // the reset's empty notice consumes a seq too, so a literal offset would
+  // leak a file after every reset.
+  void pruneMapCloudFiles()
+  {
+    std::vector<std::pair<uint64_t, std::filesystem::path>> pcds;
+    std::error_code ec;
+    for (const auto & entry : std::filesystem::directory_iterator(m_map_cloud_dir, ec)) {
+      if (!isMapCloudFile(entry)) continue;
+      if (entry.path().extension() == ".tmp") {
+        std::error_code rm_ec;
+        std::filesystem::remove(entry.path(), rm_ec);
+        continue;
+      }
+      const std::string stem = entry.path().stem().string();  // map_cloud_<seq>
+      try {
+        pcds.emplace_back(std::stoull(stem.substr(std::string("map_cloud_").size())), entry.path());
+      } catch (const std::exception &) {
+        // Not ours after all (or hand-made); leave it alone.
+      }
+    }
+    std::sort(pcds.begin(), pcds.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+    for (size_t i = 2; i < pcds.size(); ++i) {
+      std::error_code rm_ec;
+      std::filesystem::remove(pcds[i].second, rm_ec);
+    }
+  }
+
+  static std::string jsonEscape(const std::string & s)
+  {
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (const unsigned char c : s) {
+      switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+          if (c < 0x20) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+            out += buf;
+          } else {
+            out += static_cast<char>(c);
+          }
+      }
+    }
+    return out;
+  }
+
+  // The notice the backend parses. Five fixed fields, hand-formatted so this
+  // node grows no JSON dependency:
+  //   seq       monotonic within this process; informational for the reader
+  //             (a restart begins again at 1, and the reader applies it anyway)
+  //   path      absolute path of the PCD, "" when the map is empty
+  //   points    point count after the voxel filter, 0 when the map is empty
+  //   frame_id  map_frame -- the points are already global
+  //   stamp     the keyframe's time, same as the PointCloud2 header
+  std::string mapCloudNoticeJson(
+    uint64_t seq, const std::string & path, size_t points,
+    const builtin_interfaces::msg::Time & time) const
+  {
+    std::ostringstream os;
+    os << "{\"seq\":" << seq << ",\"path\":\"" << jsonEscape(path) << "\",\"points\":" << points
+       << ",\"frame_id\":\"" << jsonEscape(m_node_config.map_frame) << "\",\"stamp\":{\"sec\":"
+       << time.sec << ",\"nanosec\":" << time.nanosec << "}}";
+    return os.str();
+  }
+
+  void publishMapCloudNotice(
+    uint64_t seq, const std::string & path, size_t points,
+    const builtin_interfaces::msg::Time & time)
+  {
+    std_msgs::msg::String msg;
+    msg.data = mapCloudNoticeJson(seq, path, points, time);
+    m_map_cloud_file_pub->publish(msg);
+  }
+
+  // Write the merge as `map_cloud_<seq>.pcd` (via .tmp + rename, so a reader
+  // never sees a partial file) and announce it. Every failure is caught HERE:
+  // this runs on m_map_cloud_thread, and an exception escaping a std::thread
+  // is std::terminate -- pgo gone, TF gone, mid-run. savePCDFileBinary does
+  // throw (pcl::IOException on an empty cloud and on a failed write, ENOSPC
+  // included -- exactly what a 64 MB private /dev/shm produces at a large
+  // site), so the empty case is handled before the writer is ever called.
+  void writeAndAnnounceMapCloud(
+    const CloudType & merged, uint64_t seq, const builtin_interfaces::msg::Time & time)
+  {
+    if (merged.empty()) {
+      publishMapCloudNotice(seq, "", 0, time);
+      return;
+    }
+    const std::filesystem::path final_path =
+      std::filesystem::path(m_map_cloud_dir) / ("map_cloud_" + std::to_string(seq) + ".pcd");
+    const std::filesystem::path tmp_path = final_path.string() + ".tmp";
+    try {
+      if (pcl::io::savePCDFileBinary(tmp_path.string(), merged) != 0) {
+        throw std::runtime_error("savePCDFileBinary returned non-zero");
+      }
+      std::filesystem::rename(tmp_path, final_path);  // throws filesystem_error
+      publishMapCloudNotice(seq, final_path.string(), merged.size(), time);
+      pruneMapCloudFiles();
+    } catch (const pcl::IOException & e) {
+      RCLCPP_ERROR(
+        this->get_logger(), "[PGONode] map_cloud file hand-off failed writing %s: %s",
+        tmp_path.c_str(), e.what());
+    } catch (const std::filesystem::filesystem_error & e) {
+      RCLCPP_ERROR(
+        this->get_logger(), "[PGONode] map_cloud file hand-off failed on %s: %s",
+        tmp_path.c_str(), e.what());
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(
+        this->get_logger(), "[PGONode] map_cloud file hand-off failed: %s", e.what());
+    }
+    // Whatever happened, do not leave a half-written .tmp behind.
+    std::error_code ec;
+    std::filesystem::remove(tmp_path, ec);
   }
 
   void loadParameters()
@@ -175,6 +399,9 @@ public:
     }
     if (config["map_cloud_pub_period"]) {
       m_node_config.map_cloud_pub_period = config["map_cloud_pub_period"].as<double>();
+    }
+    if (config["map_cloud_dir"]) {
+      m_node_config.map_cloud_dir = config["map_cloud_dir"].as<std::string>();
     }
     if (config["lio_reset_service"]) {
       m_node_config.lio_reset_service = config["lio_reset_service"].as<std::string>();
@@ -362,9 +589,12 @@ public:
 
   void publishMapCloud(builtin_interfaces::msg::Time & time)
   {
-    // Same gate as publishLoopMarkers: with nobody listening (the operator
-    // console's backend is the intended subscriber) the merge is pure waste.
-    if (m_map_cloud_pub->get_subscription_count() == 0) return;
+    // Same gate as publishLoopMarkers: with nobody listening on EITHER output
+    // (the operator console's backend takes the file notice; rviz takes the
+    // PointCloud2) the merge is pure waste.
+    const bool want_msg = m_map_cloud_pub->get_subscription_count() > 0;
+    const bool want_file = m_map_cloud_dir_ok && m_map_cloud_file_pub->get_subscription_count() > 0;
+    if (!want_msg && !want_file) return;
     if (m_pgo->keyPoses().empty()) return;
 
     // Keyframe-triggered AND rate-floored: keyframes land every ~0.5 m of
@@ -392,8 +622,12 @@ public:
     // This is also why the merge does NOT go through SimplePGO::getSubMap():
     // that reads m_key_poses live and would race the next timer tick.
     std::vector<KeyPoseWithCloud> snapshot = m_pgo->keyPoses();
+    // seq is taken here, on the timer thread under m_pgo_mutex -- the same
+    // lock the reset's empty notice increments it under -- and passed by
+    // value, so the worker never touches the counter.
+    const uint64_t seq = ++m_map_cloud_seq;
     m_map_cloud_thread =
-      std::thread(&PGONode::mergeAndPublishMapCloud, this, std::move(snapshot), time);
+      std::thread(&PGONode::mergeAndPublishMapCloud, this, std::move(snapshot), time, seq);
   }
 
   // Runs on m_map_cloud_thread. The whole point of the thread: late in a run
@@ -401,7 +635,7 @@ public:
   // hundreds of ms — and timerCB owns the map->local_frame TF broadcast, which
   // must not gap for that long. rclcpp publishers are thread-safe.
   void mergeAndPublishMapCloud(
-    std::vector<KeyPoseWithCloud> snapshot, builtin_interfaces::msg::Time time)
+    std::vector<KeyPoseWithCloud> snapshot, builtin_interfaces::msg::Time time, uint64_t seq)
   {
     // 同 saveMapsCB 的合併: 逐 keyframe 用 (r_global, t_global) 轉到 map frame 疊加。
     CloudType::Ptr merged(new CloudType);
@@ -421,26 +655,39 @@ public:
       voxel_filter.filter(*merged);
     }
 
-    sensor_msgs::msg::PointCloud2 msg;
-    pcl::toROSMsg(*merged, msg);
     // Already global: every point was placed with the snapshot's corrected
     // poses, so downstream needs no TF — and a re-publish after a loop closure
-    // moves the whole map into its corrected shape.
-    msg.header.frame_id = m_node_config.map_frame;
-    msg.header.stamp = time;
-    m_map_cloud_pub->publish(msg);
+    // moves the whole map into its corrected shape. Both outputs carry the
+    // same merge; each is produced only if someone is listening to it (the
+    // subscriber counts are re-read here rather than passed in, so a reader
+    // that left during a slow merge costs nothing).
+    if (m_map_cloud_pub->get_subscription_count() > 0) {
+      sensor_msgs::msg::PointCloud2 msg;
+      pcl::toROSMsg(*merged, msg);
+      msg.header.frame_id = m_node_config.map_frame;
+      msg.header.stamp = time;
+      m_map_cloud_pub->publish(msg);
+    }
+    if (m_map_cloud_dir_ok && m_map_cloud_file_pub->get_subscription_count() > 0) {
+      writeAndAnnounceMapCloud(*merged, seq, time);
+    }
 
     // Last, deliberately: this is what lets publishMapCloud spawn the next
     // worker, and everything this thread does must be finished by then.
     m_map_cloud_busy.store(false);
   }
 
-  // Tell every consumer the map is gone. Both are published UNGATED, unlike
-  // their counterparts in the normal path: the subscriber-count check exists to
-  // skip expensive merges nobody wants, but "the map is empty now" is two dozen
-  // bytes and is precisely the message a late or idle subscriber must not miss.
-  // Without these, the last thing rviz and the operator console hold is the map
-  // the operator was just told had been discarded.
+  // Tell every consumer the map is gone. All of these are published UNGATED,
+  // unlike their counterparts in the normal path: the subscriber-count check
+  // exists to skip expensive merges nobody wants, but "the map is empty now" is
+  // two dozen bytes and is precisely the message a late or idle subscriber
+  // must not miss. Without these, the last thing rviz and the operator console
+  // hold is the map the operator was just told had been discarded.
+  //
+  // Caller holds m_pgo_mutex and has joined the worker (resetMappingCB), so
+  // the seq increment races nothing and no .tmp is mid-write when the files
+  // go. The empty notice is published BEFORE the files are removed and, being
+  // TRANSIENT_LOCAL depth 1, replaces the latched notice that named them.
   void publishEmptyMapCloud(const builtin_interfaces::msg::Time & time)
   {
     CloudType empty;
@@ -449,6 +696,9 @@ public:
     msg.header.frame_id = m_node_config.map_frame;
     msg.header.stamp = time;
     m_map_cloud_pub->publish(msg);
+
+    publishMapCloudNotice(++m_map_cloud_seq, "", 0, time);
+    clearMapCloudDir();
   }
 
   void publishLoopMarkerDeleteAll()
@@ -673,6 +923,16 @@ private:
   std::atomic<bool> m_map_cloud_busy{false};
   double m_last_map_cloud_time = 0.0;
   std::thread m_map_cloud_thread;
+  // The file hand-off (see the map_cloud_file publisher and
+  // writeAndAnnounceMapCloud). m_map_cloud_seq is only ever touched under
+  // m_pgo_mutex (publishMapCloud on the timer thread, publishEmptyMapCloud
+  // from the reset); the worker gets its value by copy. dir_ok false means
+  // the directory could not be created and the file output is off for this
+  // run -- the PointCloud2 output is unaffected.
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr m_map_cloud_file_pub;
+  uint64_t m_map_cloud_seq = 0;
+  std::string m_map_cloud_dir;
+  bool m_map_cloud_dir_ok = false;
   rclcpp::Service<interface::srv::SaveMaps>::SharedPtr m_save_map_srv;
   // The reset surface. m_resetting rejects a second concurrent call outright
   // rather than queueing it -- two resets in flight would have the second one
