@@ -9,6 +9,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <mutex>
@@ -40,6 +41,31 @@ struct NodeConfig
   double initial_pose_y = 0.0;
   double initial_pose_yaw = 0.0;
   double update_hz = 1.0;
+
+  // Motion gate. update_hz is a *ceiling* on re-registration, not a schedule:
+  // below these thresholds the odom pose has not moved enough to justify a new
+  // scan match, so the previous offset is rebroadcast and GICP is skipped
+  // entirely. For a parked robot the correct correction is a constant, and
+  // re-solving it 5 times a second only resamples GICP's own noise floor
+  // (measured on robot01 2026-09-21: 8.9 mm median / 24.9 mm max per update,
+  // 193 of 241 updates > 5 mm, while Point-LIO itself moved 0.87 mm/frame).
+  double min_update_trans = 0.05;
+  double min_update_rot = 0.02;
+  // Backstop: re-register this often even when parked, so a slow true drift is
+  // still corrected. Kept short on purpose — the failure direction we want is
+  // "jitter only partly suppressed", never "frozen on a stale pose".
+  double max_update_interval = 2.0;
+  // EMA weight applied to a backstop refresh (a re-registration that the motion
+  // gate would otherwise have skipped). Motion-triggered updates always use 1.0,
+  // so driving is bit-for-bit unchanged and picks up no lag. 1.0 here disables
+  // blending and leaves only the gate.
+  double static_blend_alpha = 0.1;
+  // After a relocalize / initial-pose guess, register at full rate and full
+  // alpha for this long. A relocalize returning success is a receipt, not a
+  // result: the pose converges over the following rounds. Gating right after
+  // the first successful align would leave a parked robot refining at one
+  // alpha=0.1 step per max_update_interval, i.e. tens of seconds to converge.
+  double post_reloc_settle = 3.0;
 };
 
 struct NodeState
@@ -61,6 +87,15 @@ struct NodeState
   M3D last_offset_r = M3D::Identity();  // map_localmap_r
   V3D last_offset_t = V3D::Zero();      // map_localmap_t
   M4F initial_guess = M4F::Identity();
+
+  // Odom pose at the last *accepted* registration — the reference the motion
+  // gate measures against. Only the timer thread touches these.
+  M3D last_reg_r = M3D::Identity();
+  V3D last_reg_t = V3D::Zero();
+  bool has_reg = false;
+  rclcpp::Time last_reg_time{0, 0, RCL_SYSTEM_TIME};
+  // Full-rate window after a relocalize; see NodeConfig::post_reloc_settle.
+  rclcpp::Time settle_until{0, 0, RCL_SYSTEM_TIME};
 };
 
 class LocalizerNode : public rclcpp::Node
@@ -185,6 +220,17 @@ public:
     m_config.map_path = declare_parameter<std::string>("map_path", m_config.map_path);
     m_config.update_hz = declare_parameter<double>("update_hz", m_config.update_hz);
 
+    // Motion gate; see NodeConfig for what each one buys.
+    m_config.min_update_trans =
+      declare_parameter<double>("min_update_trans", m_config.min_update_trans);
+    m_config.min_update_rot = declare_parameter<double>("min_update_rot", m_config.min_update_rot);
+    m_config.max_update_interval =
+      declare_parameter<double>("max_update_interval", m_config.max_update_interval);
+    m_config.static_blend_alpha =
+      declare_parameter<double>("static_blend_alpha", m_config.static_blend_alpha);
+    m_config.post_reloc_settle =
+      declare_parameter<double>("post_reloc_settle", m_config.post_reloc_settle);
+
     // 巢狀名稱（initial_pose.x）跟 syncai_amcl 的 set_initial_pose /
     // initial_pose.* 對齊，兩邊都是由 launch 從 system.ini 的 [initial_pose]
     // 覆寫。這裡刻意不收 z：見 applyPlanarGuess
@@ -276,13 +322,11 @@ public:
       service_pending = m_state.service_received;
       if (service_pending) initial_guess = m_state.initial_guess;
     }
-    if (!service_pending) {
-      std::lock_guard<std::mutex> lock(m_state.message_mutex);
-      initial_guess.block<3, 3>(0, 0) = (m_state.last_offset_r * m_state.last_r).cast<float>();
-      initial_guess.block<3, 1>(0, 3) =
-        (m_state.last_offset_r * m_state.last_t + m_state.last_offset_t).cast<float>();
-    }
 
+    // Snapshot the odom pose before deciding whether to register: the motion
+    // gate measures against it. setInput() stays on the align path — copying
+    // the cloud into the localizer is the expensive part and a gated tick must
+    // not pay it.
     M3D current_local_r;
     V3D current_local_t;
     builtin_interfaces::msg::Time current_time;
@@ -291,6 +335,45 @@ public:
       current_local_r = m_state.last_r;
       current_local_t = m_state.last_t;
       current_time = m_state.last_message_time;
+      if (!service_pending) {
+        initial_guess.block<3, 3>(0, 0) = (m_state.last_offset_r * m_state.last_r).cast<float>();
+        initial_guess.block<3, 1>(0, 3) =
+          (m_state.last_offset_r * m_state.last_t + m_state.last_offset_t).cast<float>();
+      }
+    }
+
+    // A relocalize (or the config initial pose, which reaches us the same way)
+    // must bypass the gate *and* the blend: it is the first step of a live map
+    // switch, and easing 10% toward the requested pose would be worse than
+    // useless. It also opens a full-rate settle window, because the pose only
+    // converges over the rounds that follow.
+    const rclcpp::Time now = rclcpp::Clock().now();
+    if (service_pending) {
+      m_state.settle_until = now + rclcpp::Duration::from_seconds(m_config.post_reloc_settle);
+    }
+    const bool settling = now < m_state.settle_until;
+
+    double alpha = 1.0;
+    if (!service_pending && !settling) {
+      const double moved_trans = (current_local_t - m_state.last_reg_t).norm();
+      // Rotation angle of last_reg_r -> current_local_r, via the trace.
+      const M3D dr = current_local_r * m_state.last_reg_r.transpose();
+      const double moved_rot = std::acos(std::clamp((dr.trace() - 1.0) * 0.5, -1.0, 1.0));
+      const bool moved =
+        moved_trans > m_config.min_update_trans || moved_rot > m_config.min_update_rot;
+      const bool stale = (now - m_state.last_reg_time).seconds() > m_config.max_update_interval;
+
+      if (m_state.has_reg && !moved && !stale) {
+        // Parked and recently registered: the correct offset is whatever we
+        // already hold. Rebroadcast it and skip GICP entirely.
+        sendBroadCastTF(current_time);
+        return;
+      }
+      if (!moved) alpha = m_config.static_blend_alpha;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(m_state.message_mutex);
       m_localizer->setInput(m_state.last_cloud);
     }
 
@@ -299,15 +382,34 @@ public:
     if (result) {
       M3D map_body_r = initial_guess.block<3, 3>(0, 0).cast<double>();
       V3D map_body_t = initial_guess.block<3, 1>(0, 3).cast<double>();
-      m_state.last_offset_r = map_body_r * current_local_r.transpose();
       // 重正交化：ICP 解與 odom 旋轉是 float 連乘（下一輪還會回饋進 initial_guess），
       // 誤差累積會讓 R 偏離 SO(3)，broadcast 時轉成 quaternion 的 norm 就會漂移
       // （tf2 denormalized-quaternion warning，且 skew/scale 被當成假位移）。拉回合法旋轉。
-      Eigen::Quaterniond offset_q(m_state.last_offset_r);
-      offset_q.normalize();
-      m_state.last_offset_r = offset_q.toRotationMatrix();
-      // 平移用同一個已正交化的 last_offset_r，保持旋轉/平移一致
-      m_state.last_offset_t = -m_state.last_offset_r * current_local_t + map_body_t;
+      // 融合路徑多一道連乘，所以這步更重要；slerp 本身回傳單位四元數。
+      const M3D raw_offset_r = map_body_r * current_local_r.transpose();
+      Eigen::Quaterniond cand_q(raw_offset_r);
+      cand_q.normalize();
+      M3D cand_r = cand_q.toRotationMatrix();
+      // 平移用同一個已正交化的旋轉，保持旋轉/平移一致
+      V3D cand_t = -cand_r * current_local_t + map_body_t;
+
+      // Build the candidate in locals and blend afterwards: writing
+      // last_offset_r first and then deriving last_offset_t from it (as this
+      // used to) would mix a blended rotation into an unblended translation.
+      // Eigen's slerp picks the short arc itself, so no sign fix-up is needed.
+      if (alpha < 1.0 && m_state.has_reg) {
+        cand_q = Eigen::Quaterniond(m_state.last_offset_r).slerp(alpha, cand_q);
+        cand_r = cand_q.toRotationMatrix();
+        cand_t = (1.0 - alpha) * m_state.last_offset_t + alpha * cand_t;
+      }
+      m_state.last_offset_r = cand_r;
+      m_state.last_offset_t = cand_t;
+
+      m_state.last_reg_r = current_local_r;
+      m_state.last_reg_t = current_local_t;
+      m_state.last_reg_time = now;
+      m_state.has_reg = true;
+
       std::lock_guard<std::mutex> lock(m_state.service_mutex);
       if (!m_state.localize_success && m_state.service_received) {
         m_state.localize_success = true;

@@ -48,6 +48,55 @@
     # 出現 CPU 搶佔（控制迴圈掉拍），先降回 3.0 而不是動 num_threads
     update_hz: 5.0
 
+    # Motion gate (2026-09-21, robot01 on the dp2f map). update_hz above is a
+    # ceiling, not a schedule: below these thresholds the odom pose has not
+    # moved enough to justify a new scan match, so timerCB rebroadcasts the
+    # previous offset and skips GICP entirely.
+    #
+    # Why: parked for 60 s, the localizer's own correction (map -> pointlio_odom)
+    # swung 33.7 mm in x / 29.0 mm in y / 1.07 deg, with 193 of 241 updates
+    # moving more than 5 mm — every round, not occasionally. Point-LIO
+    # underneath it (pointlio_odom -> pointlio_body) moved only 7.8 / 6.9 mm /
+    # 0.27 deg, 0.87 mm per frame. So the jitter is not odometry drift: it is
+    # GICP's noise floor being resampled 5 times a second. Livox's
+    # non-repetitive scan puts different points in each frame, so the minimum
+    # lands somewhere slightly different every time, while the true correction
+    # for a stationary robot is a constant. Downstream, syncai_robot_state
+    # samples map -> base_link at 1 Hz, i.e. a random phase of that +/-2 cm
+    # swing, which is why the console looks like it teleports.
+    #
+    # This is NOT the degenerate-geometry double-solution bouncing recorded
+    # under rough_registration_type below (~0.17 m): today's x/y noise is
+    # roughly isotropic and site-independent.
+    #
+    # Rejected alternatives:
+    #   - Plain EMA on every update (no gate): also smooths while driving, and
+    #     alpha=0.3 at 5 Hz lags ~0.28 m at 0.6 m/s.
+    #   - Plain deadband (drop sub-threshold solutions): a true drift below the
+    #     threshold would never be corrected, and a threshold sitting on the
+    #     noise amplitude turns steady jitter into intermittent large steps.
+    #
+    # Thresholds are deliberately small and the backstop short: the failure
+    # direction we want is "jitter only partly suppressed", never "frozen on a
+    # stale pose".
+    min_update_trans: 0.05
+    min_update_rot: 0.02
+    # Re-register this often even when parked, so a slow true drift is still
+    # corrected. Expect map -> pointlio_odom to update at 1/this Hz at standstill.
+    max_update_interval: 2.0
+    # EMA weight for a backstop refresh (one the gate would otherwise have
+    # skipped). Motion-triggered updates always use 1.0, so driving is unchanged
+    # and picks up no lag. Set to 1.0 to keep the gate but drop the blending.
+    static_blend_alpha: 0.1
+    # After a relocalize / initial-pose guess, register at full rate and full
+    # alpha for this long. relocalize returning success is a receipt, not a
+    # result — the pose converges over the rounds that follow, and gating right
+    # after the first successful align would leave a parked robot refining one
+    # alpha=0.1 step per max_update_interval (tens of seconds). 3 s at 5 Hz is
+    # ~15 full-rate rounds. This matters most for the live map switch
+    # (POST /api/v1/maps/{name}/activate), whose first step is relocalize.
+    post_reloc_settle: 3.0
+
     # 配準後端是 small_gicp 的 GICP（原本是 pcl::IterativeClosestPoint 的
     # point-to-point）。num_threads 給協方差估計、KD-tree 建構與 reduction 用；
     # localizer 跟 pointlio 共用同一顆 CPU，不要開滿。
