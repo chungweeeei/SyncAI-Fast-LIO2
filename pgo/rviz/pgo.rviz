@@ -145,7 +145,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /robot06/fastlio2/lio_path
+        Value: /pointlio/lio_path
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true

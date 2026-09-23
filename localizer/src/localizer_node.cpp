@@ -9,6 +9,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <mutex>
@@ -23,23 +24,50 @@ using namespace std::chrono_literals;
 
 struct NodeConfig
 {
-  std::string cloud_topic = "/fastlio2/body_cloud";
-  std::string odom_topic = "/fastlio2/lio_odom";
+  std::string cloud_topic = "/pointlio/body_cloud";
+  std::string odom_topic = "/pointlio/lio_odom";
   std::string map_frame = "map";
   std::string local_frame = "lidar";
-  // system.ini 的 [map] pcd，由 launch 以 parameter override 傳進來。initialpose 在地圖
-  // 尚未載入時（localizer 重啟後還沒跑過 relocalize）用它自動 loadMap；
-  // 空字串表示沒設定，此時 initialpose 只能在 relocalize 之後使用
+  // The [map] pcd from system.ini, passed in by the launch file as a parameter override.
+  // initialpose uses it to loadMap automatically when no map is loaded yet (the localizer was
+  // restarted and no relocalize has run since); an empty string means it is not set, in which
+  // case initialpose can only be used after a relocalize.
   std::string map_path = "";
-  // system.ini 的 [initial_pose]：機器人開機時的已知起點（map frame）。設了以後
-  // 收到第一筆 odom 就自動套用一次當 ICP 的 initial guess，等同於自動跑一次
-  // relocalize，不必手動呼叫 service。
-  // 只有 x / y / yaw：z / roll / pitch 一律取自當下估計，理由見 applyPlanarGuess。
+  // The [initial_pose] from system.ini: the robot's known start pose at boot (map frame). When
+  // set, it is applied once as the ICP initial guess as soon as the first odom arrives, which is
+  // equivalent to an automatic relocalize with no manual service call.
+  // Only x / y / yaw: z / roll / pitch are always taken from the current estimate, for the
+  // reasons given at applyPlanarGuess.
   bool set_initial_pose = false;
   double initial_pose_x = 0.0;
   double initial_pose_y = 0.0;
   double initial_pose_yaw = 0.0;
   double update_hz = 1.0;
+
+  // Motion gate. update_hz is a *ceiling* on re-registration, not a schedule:
+  // below these thresholds the odom pose has not moved enough to justify a new
+  // scan match, so the previous offset is rebroadcast and GICP is skipped
+  // entirely. For a parked robot the correct correction is a constant, and
+  // re-solving it 5 times a second only resamples GICP's own noise floor
+  // (measured on robot01 2026-09-21: 8.9 mm median / 24.9 mm max per update,
+  // 193 of 241 updates > 5 mm, while Point-LIO itself moved 0.87 mm/frame).
+  double min_update_trans = 0.05;
+  double min_update_rot = 0.02;
+  // Backstop: re-register this often even when parked, so a slow true drift is
+  // still corrected. Kept short on purpose — the failure direction we want is
+  // "jitter only partly suppressed", never "frozen on a stale pose".
+  double max_update_interval = 2.0;
+  // EMA weight applied to a backstop refresh (a re-registration that the motion
+  // gate would otherwise have skipped). Motion-triggered updates always use 1.0,
+  // so driving is bit-for-bit unchanged and picks up no lag. 1.0 here disables
+  // blending and leaves only the gate.
+  double static_blend_alpha = 0.1;
+  // After a relocalize / initial-pose guess, register at full rate and full
+  // alpha for this long. A relocalize returning success is a receipt, not a
+  // result: the pose converges over the following rounds. Gating right after
+  // the first successful align would leave a parked robot refining at one
+  // alpha=0.1 step per max_update_interval, i.e. tens of seconds to converge.
+  double post_reloc_settle = 3.0;
 };
 
 struct NodeState
@@ -50,8 +78,9 @@ struct NodeState
   bool message_received = false;
   bool service_received = false;
   bool localize_success = false;
-  // config 的起點還沒套用。只有 timer 那條 thread 會碰它（建構期設定，spin
-  // 開始後只在 timerCB 讀寫），所以不需要鎖
+  // The start pose from config has not been applied yet. Only the timer thread touches it (set
+  // during construction, then read and written only in timerCB once spin has started), so it
+  // needs no lock.
   bool initial_pose_pending = false;
   rclcpp::Time last_send_tf_time = rclcpp::Clock().now();
   builtin_interfaces::msg::Time last_message_time;
@@ -61,6 +90,15 @@ struct NodeState
   M3D last_offset_r = M3D::Identity();  // map_localmap_r
   V3D last_offset_t = V3D::Zero();      // map_localmap_t
   M4F initial_guess = M4F::Identity();
+
+  // Odom pose at the last *accepted* registration — the reference the motion
+  // gate measures against. Only the timer thread touches these.
+  M3D last_reg_r = M3D::Identity();
+  V3D last_reg_t = V3D::Zero();
+  bool has_reg = false;
+  rclcpp::Time last_reg_time{0, 0, RCL_SYSTEM_TIME};
+  // Full-rate window after a relocalize; see NodeConfig::post_reloc_settle.
+  rclcpp::Time settle_until{0, 0, RCL_SYSTEM_TIME};
 };
 
 class LocalizerNode : public rclcpp::Node
@@ -92,8 +130,9 @@ public:
     // localizer
     m_localizer = std::make_shared<ICPLocalizer>(m_localizer_config);
 
-    // services 放在獨立的 callback group（搭配 main 的 MultiThreadedExecutor），
-    // relocCB 裡耗時的 loadMap 才不會卡住 timer/subscriber 那組的 TF 重播
+    // The services live in their own callback group (paired with the MultiThreadedExecutor in
+    // main), so the slow loadMap inside relocCB cannot stall the TF rebroadcast running in the
+    // timer/subscriber group.
     m_srv_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
     m_reloc_srv = this->create_service<interface::srv::Relocalize>(
@@ -106,33 +145,36 @@ public:
       std::bind(&LocalizerNode::relocCheckCB, this, std::placeholders::_1, std::placeholders::_2),
       rmw_qos_profile_services_default, m_srv_cb_group);
 
-    // RViz「2D Pose Estimate」等來源的 initial guess：走 relocalize 同一條
-    // initial_guess 路徑（下一輪 timerCB 拿去餵 ICP）。地圖正常情況下已在建構
-    // 期載好（loadInitialMap），callback 裡只剩補救用的 loadMap 分支。
-    // 那個分支可能耗時數秒，所以跟 services 放同一個 callback group，
-    // 才不會卡住 timer 那組的 TF 重播
+    // Initial guesses from sources such as RViz's "2D Pose Estimate": they take the same
+    // initial_guess path as relocalize (the next timerCB round feeds it to ICP). Normally the map
+    // is already loaded during construction (loadInitialMap), so all that is left in the callback
+    // is the fallback loadMap branch. That branch can take several seconds, which is why it shares
+    // the services' callback group — so it cannot stall the TF rebroadcast in the timer group.
     rclcpp::SubscriptionOptions initialpose_options;
     initialpose_options.callback_group = m_srv_cb_group;
     m_initialpose_sub = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       "initialpose", 10, std::bind(&LocalizerNode::initialPoseCB, this, std::placeholders::_1),
       initialpose_options);
 
-    // 地圖是靜態的：transient_local（latched）+ loadMap 成功後發一次，
-    // 晚連上的訂閱者也收得到（RViz 端的 QoS 也要設成 transient_local）
+    // The map is static: transient_local (latched) plus one publish after a successful loadMap, so
+    // late-joining subscribers still receive it (the RViz side must set its QoS to transient_local
+    // too).
     m_map_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
       "map_cloud", rclcpp::QoS(1).transient_local());
 
-    // 地圖在建構期就載好。以前只有 relocalize 才 loadMap，重啟後先發
-    // initialpose 會撞上空 target（align() 直接 return false）；每個入口各自
-    // 補一次 loadMap 也讓「地圖是否已載入」變成隱性狀態。現在 launch 保證
-    // map_path 存在（缺檔就不啟動 node），這裡一次載完，relocalize /
-    // initialpose 只需要處理 guess。
-    // 必須放在 m_map_cloud_pub 之後（載完要 latched 發一次），而 spin 還沒
-    // 開始，同步載入數秒不會卡到任何 callback。
+    // Load the map during construction. Previously only relocalize called loadMap, so an
+    // initialpose sent first after a restart hit an empty target (align() returned false
+    // outright); and having every entry point do its own catch-up loadMap turned "is the map
+    // loaded" into hidden state. The launch file now guarantees map_path exists (the node is not
+    // started when the file is missing), so the map is loaded once here and relocalize /
+    // initialpose only have to deal with the guess.
+    // This must come after m_map_cloud_pub (the loaded map is published once, latched), and spin
+    // has not started yet, so a synchronous load of a few seconds blocks no callback.
     loadInitialMap();
 
-    // 起點只能延後到第一筆 odom 之後才套用（applyPlanarGuess 要拿當下估計補
-    // roll/pitch/z），所以建構期只立旗標，實際套用在 timerCB
+    // The start pose can only be applied after the first odom (applyPlanarGuess needs the current
+    // estimate to fill in roll/pitch/z), so the constructor only raises the flag and the actual
+    // application happens in timerCB.
     m_state.initial_pose_pending = m_config.set_initial_pose;
     if (m_config.set_initial_pose) {
       RCLCPP_INFO(
@@ -172,12 +214,13 @@ public:
 
   void loadParameters()
   {
-    // 走標準 ROS 2 parameters（config/localizer.yaml 是 /**/localizer_node 的
-    // params 檔，launch 再疊上 robot_id 前綴的 topic / map_path 覆寫）。
-    // 舊版是自己用 yaml-cpp 讀 config_path 指到的扁平 YAML：ros2 param 只看得到
-    // config_path、不能用 --params-file，而且 config_path 沒帶時 YAML::LoadFile
-    // 會丟例外、必填 key 少一個就 InvalidNode，node 直接在建構期掛掉。
-    // 現在每個參數都以 struct 的預設值當 default，缺項只是沿用預設。
+    // Standard ROS 2 parameters (config/localizer.yaml is the /**/localizer_node params file; the
+    // launch file layers the robot_id-prefixed topic / map_path overrides on top). The old version
+    // parsed a flat YAML at config_path with yaml-cpp itself: `ros2 param` could only see
+    // config_path, --params-file could not be used, and when config_path was not given
+    // YAML::LoadFile threw, while a single missing required key raised InvalidNode — the node
+    // died during construction either way. Now every parameter takes the struct's value as its
+    // default, so a missing entry simply keeps that default.
     m_config.cloud_topic = declare_parameter<std::string>("cloud_topic", m_config.cloud_topic);
     m_config.odom_topic = declare_parameter<std::string>("odom_topic", m_config.odom_topic);
     m_config.map_frame = declare_parameter<std::string>("map_frame", m_config.map_frame);
@@ -185,9 +228,20 @@ public:
     m_config.map_path = declare_parameter<std::string>("map_path", m_config.map_path);
     m_config.update_hz = declare_parameter<double>("update_hz", m_config.update_hz);
 
-    // 巢狀名稱（initial_pose.x）跟 syncai_amcl 的 set_initial_pose /
-    // initial_pose.* 對齊，兩邊都是由 launch 從 system.ini 的 [initial_pose]
-    // 覆寫。這裡刻意不收 z：見 applyPlanarGuess
+    // Motion gate; see NodeConfig for what each one buys.
+    m_config.min_update_trans =
+      declare_parameter<double>("min_update_trans", m_config.min_update_trans);
+    m_config.min_update_rot = declare_parameter<double>("min_update_rot", m_config.min_update_rot);
+    m_config.max_update_interval =
+      declare_parameter<double>("max_update_interval", m_config.max_update_interval);
+    m_config.static_blend_alpha =
+      declare_parameter<double>("static_blend_alpha", m_config.static_blend_alpha);
+    m_config.post_reloc_settle =
+      declare_parameter<double>("post_reloc_settle", m_config.post_reloc_settle);
+
+    // The nested names (initial_pose.x) line up with syncai_amcl's set_initial_pose /
+    // initial_pose.*; both are overridden by the launch file from the [initial_pose] section of
+    // system.ini. z is deliberately not accepted here: see applyPlanarGuess.
     m_config.set_initial_pose =
       declare_parameter<bool>("set_initial_pose", m_config.set_initial_pose);
     m_config.initial_pose_x = declare_parameter<double>("initial_pose.x", m_config.initial_pose_x);
@@ -195,7 +249,7 @@ public:
     m_config.initial_pose_yaw =
       declare_parameter<double>("initial_pose.yaw", m_config.initial_pose_yaw);
 
-    // small_gicp 後端的共用參數，兩段配準共享
+    // Common parameters of the small_gicp backend, shared by both registration stages.
     m_localizer_config.num_threads =
       declare_parameter<int>("num_threads", m_localizer_config.num_threads);
     m_localizer_config.num_neighbors =
@@ -241,9 +295,11 @@ public:
   {
     if (!m_state.message_received) return;
 
-    // config 的已知起點：第一筆 odom 到了才有「當下估計」可以補 roll/pitch/z，
-    // 所以在這裡套用而不是建構期。只有一次機會——旗標先清掉，就算地圖沒載入
-    // 而跳過，也不會留到之後某次 relocalize 載完圖才突然蓋掉那次的 guess。
+    // The known start pose from config: only once the first odom has arrived is there a "current
+    // estimate" to fill in roll/pitch/z, so it is applied here rather than in the constructor. It
+    // gets exactly one chance — the flag is cleared first, so even if it is skipped because no
+    // map is loaded, it does not linger until some later relocalize finishes loading a map and
+    // then suddenly overwrite that call's guess.
     if (m_state.initial_pose_pending) {
       m_state.initial_pose_pending = false;
       if (m_localizer->isMapLoaded()) {
@@ -258,7 +314,8 @@ public:
 
     rclcpp::Duration diff = rclcpp::Clock().now() - m_state.last_send_tf_time;
 
-    // 判斷距離上次發佈 TF 的時間，小於 1 / update_hz 就發佈上次的 TF
+    // Check the time since the last TF publish; if it is under 1 / update_hz, republish the
+    // previous TF.
     bool update_tf = diff.seconds() > (1.0 / m_config.update_hz) && m_state.message_received;
 
     if (!update_tf) {
@@ -268,7 +325,7 @@ public:
 
     m_state.last_send_tf_time = rclcpp::Clock().now();
 
-    // 跑 rough + refine ICP，成攻就更新 offset
+    // Run rough + refine ICP and update the offset on success.
     M4F initial_guess = M4F::Identity();
     bool service_pending = false;
     {
@@ -276,13 +333,11 @@ public:
       service_pending = m_state.service_received;
       if (service_pending) initial_guess = m_state.initial_guess;
     }
-    if (!service_pending) {
-      std::lock_guard<std::mutex> lock(m_state.message_mutex);
-      initial_guess.block<3, 3>(0, 0) = (m_state.last_offset_r * m_state.last_r).cast<float>();
-      initial_guess.block<3, 1>(0, 3) =
-        (m_state.last_offset_r * m_state.last_t + m_state.last_offset_t).cast<float>();
-    }
 
+    // Snapshot the odom pose before deciding whether to register: the motion
+    // gate measures against it. setInput() stays on the align path — copying
+    // the cloud into the localizer is the expensive part and a gated tick must
+    // not pay it.
     M3D current_local_r;
     V3D current_local_t;
     builtin_interfaces::msg::Time current_time;
@@ -291,23 +346,88 @@ public:
       current_local_r = m_state.last_r;
       current_local_t = m_state.last_t;
       current_time = m_state.last_message_time;
+      if (!service_pending) {
+        initial_guess.block<3, 3>(0, 0) = (m_state.last_offset_r * m_state.last_r).cast<float>();
+        initial_guess.block<3, 1>(0, 3) =
+          (m_state.last_offset_r * m_state.last_t + m_state.last_offset_t).cast<float>();
+      }
+    }
+
+    // A relocalize (or the config initial pose, which reaches us the same way)
+    // must bypass the gate *and* the blend: it is the first step of a live map
+    // switch, and easing 10% toward the requested pose would be worse than
+    // useless. It also opens a full-rate settle window, because the pose only
+    // converges over the rounds that follow.
+    const rclcpp::Time now = rclcpp::Clock().now();
+    if (service_pending) {
+      m_state.settle_until = now + rclcpp::Duration::from_seconds(m_config.post_reloc_settle);
+    }
+    const bool settling = now < m_state.settle_until;
+
+    double alpha = 1.0;
+    if (!service_pending && !settling) {
+      const double moved_trans = (current_local_t - m_state.last_reg_t).norm();
+      // Rotation angle of last_reg_r -> current_local_r, via the trace.
+      const M3D dr = current_local_r * m_state.last_reg_r.transpose();
+      const double moved_rot = std::acos(std::clamp((dr.trace() - 1.0) * 0.5, -1.0, 1.0));
+      const bool moved =
+        moved_trans > m_config.min_update_trans || moved_rot > m_config.min_update_rot;
+      const bool stale = (now - m_state.last_reg_time).seconds() > m_config.max_update_interval;
+
+      if (m_state.has_reg && !moved && !stale) {
+        // Parked and recently registered: the correct offset is whatever we
+        // already hold. Rebroadcast it and skip GICP entirely.
+        sendBroadCastTF(current_time);
+        return;
+      }
+      if (!moved) alpha = m_config.static_blend_alpha;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(m_state.message_mutex);
       m_localizer->setInput(m_state.last_cloud);
     }
 
-    // 地圖只有在 relocCB 才會 loadMap, target pointcloud 是空的, align 會直接 return false
+    // With no map loaded the target cloud is empty and align() returns false outright, before
+    // touching the guess. Normally loadInitialMap() has loaded it in the constructor; this only
+    // happens when map_path was unset or unreadable and no relocalize / initialpose has loaded one
+    // since.
     bool result = m_localizer->align(initial_guess);
     if (result) {
       M3D map_body_r = initial_guess.block<3, 3>(0, 0).cast<double>();
       V3D map_body_t = initial_guess.block<3, 1>(0, 3).cast<double>();
-      m_state.last_offset_r = map_body_r * current_local_r.transpose();
-      // 重正交化：ICP 解與 odom 旋轉是 float 連乘（下一輪還會回饋進 initial_guess），
-      // 誤差累積會讓 R 偏離 SO(3)，broadcast 時轉成 quaternion 的 norm 就會漂移
-      // （tf2 denormalized-quaternion warning，且 skew/scale 被當成假位移）。拉回合法旋轉。
-      Eigen::Quaterniond offset_q(m_state.last_offset_r);
-      offset_q.normalize();
-      m_state.last_offset_r = offset_q.toRotationMatrix();
-      // 平移用同一個已正交化的 last_offset_r，保持旋轉/平移一致
-      m_state.last_offset_t = -m_state.last_offset_r * current_local_t + map_body_t;
+      // Re-orthonormalize: the ICP solution and the odom rotation are chained float products (and
+      // are fed back into initial_guess on the next round), so accumulated error drifts R off
+      // SO(3), and the norm of the quaternion it is converted to at broadcast time drifts with it
+      // (tf2 denormalized-quaternion warning, and the skew/scale gets read as a spurious
+      // displacement). Pull it back to a valid rotation. The blending path adds one more product
+      // to the chain, which makes this step more important there; slerp itself returns a unit
+      // quaternion.
+      const M3D raw_offset_r = map_body_r * current_local_r.transpose();
+      Eigen::Quaterniond cand_q(raw_offset_r);
+      cand_q.normalize();
+      M3D cand_r = cand_q.toRotationMatrix();
+      // Use the same orthonormalized rotation for the translation so rotation and translation
+      // stay consistent.
+      V3D cand_t = -cand_r * current_local_t + map_body_t;
+
+      // Build the candidate in locals and blend afterwards: writing
+      // last_offset_r first and then deriving last_offset_t from it (as this
+      // used to) would mix a blended rotation into an unblended translation.
+      // Eigen's slerp picks the short arc itself, so no sign fix-up is needed.
+      if (alpha < 1.0 && m_state.has_reg) {
+        cand_q = Eigen::Quaterniond(m_state.last_offset_r).slerp(alpha, cand_q);
+        cand_r = cand_q.toRotationMatrix();
+        cand_t = (1.0 - alpha) * m_state.last_offset_t + alpha * cand_t;
+      }
+      m_state.last_offset_r = cand_r;
+      m_state.last_offset_t = cand_t;
+
+      m_state.last_reg_r = current_local_r;
+      m_state.last_reg_t = current_local_t;
+      m_state.last_reg_time = now;
+      m_state.has_reg = true;
+
       std::lock_guard<std::mutex> lock(m_state.service_mutex);
       if (!m_state.localize_success && m_state.service_received) {
         m_state.localize_success = true;
@@ -395,7 +515,8 @@ public:
       m_state.localize_success = false;
     }
 
-    // 地圖只在這裡才會改變，latched 發一次給 RViz 等訂閱者
+    // This is the only place the map changes; publish it once, latched, for RViz and any other
+    // subscriber.
     builtin_interfaces::msg::Time stamp = this->now();
     publishMapCloud(stamp);
 
@@ -406,11 +527,12 @@ public:
 
   void initialPoseCB(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
   {
-    // 正常路徑上地圖已經在建構期載好（loadInitialMap），這段只在 map_path 沒設
-    // 或當時載入失敗時才會走到。保留它是因為地圖沒載入時 align() 會在空 target
-    // 上直接 return false（連 guess 都不會 log），initialpose 看起來就像完全沒
-    // 反應——實機上就是這樣中招過。這裡要嘛補載成功、要嘛明確警告並忽略，
-    // 不留下一個等地圖載入後才生效的過期 guess。
+    // On the normal path the map was already loaded during construction (loadInitialMap); this
+    // block is only reached when map_path was not set or that load failed. It is kept because,
+    // with no map loaded, align() returns false outright on the empty target (the guess is not
+    // even logged), so initialpose looks like it did nothing at all — which is exactly how it bit
+    // us on the robot. Here we either load the map successfully or warn explicitly and ignore the
+    // message, never leaving behind a stale guess that only takes effect once a map is loaded.
     if (!m_localizer->isMapLoaded()) {
       if (m_config.map_path.empty() || !std::filesystem::exists(m_config.map_path)) {
         RCLCPP_WARN(
@@ -449,16 +571,18 @@ public:
       std::atan2(msg_r(1, 0), msg_r(0, 0)), "initialpose");
   }
 
-  // 把 2D 起點（x, y, yaw）組成 ICP 的 initial guess。兩個來源共用：RViz /
-  // 前端 gridmap 的 initialpose，以及 system.ini [initial_pose] 的開機起點。
+  // Build the ICP initial guess from a 2D start pose (x, y, yaw). Shared by two sources: the
+  // initialpose from RViz / the console's gridmap, and the boot start pose from system.ini
+  // [initial_pose].
   //
-  // 2D 來源只給得出 x, y, yaw（z=0、roll=pitch=0）。但雷達斜裝 + map 重力對齊
-  // 時，map_T_body 恆帶 ~15° 的 mount pitch：直接拿 2D 姿態當 guess 會讓 scan
-  // 相對地圖整體傾斜，遠處點的誤差超過 rough_max_corr_dist，rough ICP 永遠過不
-  // 了 score 門檻——而 pending 期間 timerCB 又跳過 odom 回饋路徑，定位就凍在舊
-  // offset 上無限重試（實機在 (5.0, 0.982) 發 initialpose 卡死，補上 14.6°
-  // pitch 後同一位置第一輪就收斂）。
-  // 所以只取 x, y, yaw；roll/pitch/z 一律從目前估計補齊。
+  // A 2D source can only yield x, y, yaw (z=0, roll=pitch=0). But with a tilted lidar mount and a
+  // gravity-aligned map, map_T_body always carries the ~15° mount pitch: using the 2D pose
+  // directly as the guess tilts the whole scan relative to the map, the error of far-away points
+  // exceeds rough_max_corr_dist, and rough ICP never passes the score threshold — and while the
+  // guess is pending, timerCB also skips the odom feedback path, so localization freezes on the
+  // old offset and retries forever (measured on the robot: an initialpose at (5.0, 0.982) hung;
+  // with the 14.6° pitch filled in, the same spot converged on the first round).
+  // So only x, y, yaw are taken; roll/pitch/z are always filled in from the current estimate.
   void applyPlanarGuess(double x, double y, double yaw, const char * source)
   {
     M3D guess_r = Eigen::AngleAxisd(yaw, V3D::UnitZ()).toRotationMatrix();
@@ -469,12 +593,12 @@ public:
         M3D cur_r = m_state.last_offset_r * m_state.last_r;
         V3D cur_t = m_state.last_offset_r * m_state.last_t + m_state.last_offset_t;
         double cur_yaw = std::atan2(cur_r(1, 0), cur_r(0, 0));
-        // 保留目前姿態的重力傾角，只把 heading 轉到指定的 yaw
+        // Keep the gravity tilt of the current pose and only turn the heading to the requested yaw.
         guess_r = Eigen::AngleAxisd(yaw - cur_yaw, V3D::UnitZ()).toRotationMatrix() * cur_r;
         guess_t.z() = cur_t.z();
       }
-      // 開機初期還沒收到任何 odom 時沒有估計可補，就用純 2D 的姿態
-      // （config 的起點是等到第一筆 odom 才套用，不會走到這裡）
+      // Early at boot, before any odom has arrived, there is no estimate to fill in from, so the
+      // pure 2D pose is used (the config start pose waits for the first odom and never gets here).
     }
 
     std::lock_guard<std::mutex> lock(m_state.service_mutex);
@@ -502,7 +626,7 @@ public:
   }
   void publishMapCloud(builtin_interfaces::msg::Time & time)
   {
-    // latched：即使當下沒有訂閱者也要發，DDS 會快取給晚連上的訂閱者
+    // Latched: publish even when there is no subscriber right now; DDS caches it for late joiners.
     CloudType::Ptr map_cloud = m_localizer->refineMap();
     if (map_cloud->size() < 1) return;
     sensor_msgs::msg::PointCloud2 map_cloud_msg;
@@ -536,8 +660,8 @@ int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<LocalizerNode>();
-  // 兩條線程：timer/subscriber 一組、services 一組，
-  // relocalize 的 loadMap 進行中 TF 重播不中斷
+  // Two threads: one for the timer/subscriber group, one for the services, so the TF rebroadcast
+  // keeps running while relocalize's loadMap is in progress.
   rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
   executor.add_node(node);
   executor.spin();

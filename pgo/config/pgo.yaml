@@ -29,3 +29,12 @@ min_loop_detect_duration: 5.0
 # keyframe-triggered; the period below is a floor on top of that.
 map_cloud_resolution: 0.2   # voxel leaf (m) of the published merge
 map_cloud_pub_period: 3.0   # min seconds between publishes
+# The merge is ALSO handed to the operator console's backend as a binary PCD
+# in this directory, announced by a small JSON notice on pgo/map_cloud_file
+# (the PointCloud2 on pgo/map_cloud stays for rviz). A large site's merge is
+# 16-45 MB, which CycloneDDS over UDP on `lo` cannot deliver through the
+# kernel's default 208 KB socket buffer -- the console's preview used to stop
+# once the map grew. Must be a tmpfs the backend's container shares, i.e.
+# the host's /dev/shm with `ipc: host` on both compose services (a private
+# /dev/shm is 64 MB). pgo_launch.py appends /<robot_id>; this is the base.
+map_cloud_dir: /dev/shm/syncai_pgo

@@ -4,8 +4,8 @@
 
 enum BuilderStatus
 {
-    IMU_INIT,       // 累積夠 IMU
-    MAP_INIT,       // 建立完初始地圖
+    IMU_INIT,       // accumulating enough IMU samples
+    MAP_INIT,       // initial map built
     MAPPING         
 };
 
@@ -19,9 +19,9 @@ public:
     std::shared_ptr<LidarProcessor> lidar_processor() { return m_lidar_processor; }
 
 private:
-    // 一筆 IMU 事件: predict 到該時刻 + 以 IMU 作為量測更新 (output model)
+    // One IMU event: predict to its time + update with the IMU as a measurement (output model)
     void processIMU(const IMUData &imu);
-    // 把 nominal state 往前推到 time (covariance 維持 IMU 頻率傳播)
+    // Push the nominal state forward to time (the covariance keeps propagating at IMU rate)
     void predictTo(double time);
 
     Config m_config;

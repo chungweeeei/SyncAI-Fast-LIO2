@@ -25,7 +25,7 @@ void HBA::optimize()
     Vec<Pose> poses = m_poses;
     initial_estimates.clear();
     graph.resize(0);
-    // 设置初始值
+    // Set initial values
 
     std::cout << "INIT POSE ESTIMATE" << std::endl;
     for (size_t j = 0; j < m_poses.size(); j++)
@@ -44,7 +44,7 @@ void HBA::optimize()
     Vec<Pose> between_factors_pose;
     Vec<M6D> between_factors_info;
     getAllFactors(between_factors_id, between_factors_pose, between_factors_info);
-    // 添加二元因子
+    // Add binary factors
 
     std::cout << "CONSTRUCT BETWEEN FACTORS" << std::endl;
     for (size_t j = 0; j < between_factors_id.size(); j++)
@@ -55,12 +55,12 @@ void HBA::optimize()
                                                           gtsam::noiseModel::Gaussian::Information(between_factors_info[j]));
         graph.add(between_factor);
     }
-    // 优化
+    // Optimize
     gtsam::LevenbergMarquardtOptimizer optimizer(graph, initial_estimates, lm_params);
 
     std::cout << "LM OPTIMIZE " << std::endl;
     gtsam::Values result = optimizer.optimize();
-    // 更新位姿
+    // Update poses
     std::cout << "UPDATE POSE ESTIMATE" << std::endl;
     for (size_t j = 0; j < m_poses.size(); j++)
     {
